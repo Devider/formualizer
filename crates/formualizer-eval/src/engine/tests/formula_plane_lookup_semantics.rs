@@ -614,6 +614,420 @@ enum LookupExpected {
     Text(&'static str),
 }
 
+fn assert_lookup_expected(actual: LiteralValue, expected: LookupExpected, label: &str) {
+    match expected {
+        LookupExpected::Number(expected_number) => {
+            let actual_number = match actual {
+                LiteralValue::Number(number) => number,
+                LiteralValue::Int(number) => number as f64,
+                other => panic!("{label}: expected {expected_number}, got {other:?}"),
+            };
+            assert_eq!(actual_number, expected_number, "{label}");
+        }
+        LookupExpected::Na => assert!(
+            matches!(actual, LiteralValue::Error(ref error) if error.kind == ExcelErrorKind::Na),
+            "{label}: expected #N/A, got {actual:?}"
+        ),
+        LookupExpected::Text(expected_text) => {
+            assert_eq!(actual, LiteralValue::Text(expected_text.into()), "{label}")
+        }
+    }
+}
+
+fn evaluate_lookup_fixture(
+    values: [Option<f64>; 3],
+    horizontal: bool,
+    formula_text: &str,
+) -> LiteralValue {
+    let mut engine = engine_with_mode(FormulaPlaneMode::Off);
+    for (offset, value_num) in values.into_iter().enumerate() {
+        let offset = offset as u32;
+        if let Some(value_num) = value_num {
+            if horizontal {
+                number(&mut engine, "Sheet1", 5, offset + 1, value_num);
+            } else {
+                number(&mut engine, "Sheet1", offset + 1, 1, value_num);
+            }
+        }
+        text(
+            &mut engine,
+            "Sheet1",
+            offset + 1,
+            4,
+            &format!("p{}", offset + 1),
+        );
+    }
+    formula(&mut engine, "Sheet1", 1, 8, formula_text);
+    engine.evaluate_all().unwrap();
+    engine
+        .get_cell_value("Sheet1", 1, 8)
+        .expect("lookup fixture result")
+}
+
+#[test]
+fn contributor_x_function_blank_needle_oracle_cases() {
+    let cases = [
+        (
+            "X1",
+            [Some(1.0), Some(5.0), Some(0.0)],
+            "=XMATCH(F1,A1:A3,0)",
+            LookupExpected::Na,
+        ),
+        (
+            "X2",
+            [Some(1.0), Some(5.0), Some(0.0)],
+            "=XLOOKUP(F1,A1:A3,D1:D3,\"NF\",0,1)",
+            LookupExpected::Text("NF"),
+        ),
+        (
+            "X3",
+            [Some(1.0), Some(5.0), Some(0.0)],
+            "=MATCH(F1,A1:A3,0)",
+            LookupExpected::Number(3.0),
+        ),
+        (
+            "X4",
+            [Some(1.0), Some(5.0), Some(0.0)],
+            "=XLOOKUP(0,A1:A3,D1:D3,\"NF\",0,1)",
+            LookupExpected::Text("p3"),
+        ),
+        (
+            "X5",
+            [Some(0.0), None, Some(1.0)],
+            "=XMATCH(F1,A1:A3,0)",
+            LookupExpected::Number(2.0),
+        ),
+        (
+            "X6",
+            [Some(0.0), None, Some(1.0)],
+            "=XLOOKUP(F1,A1:A3,D1:D3,\"NF\",0,1)",
+            LookupExpected::Text("p2"),
+        ),
+        (
+            "X7",
+            [Some(0.0), None, Some(1.0)],
+            "=XLOOKUP(F1,A1:A3,D1:D3,\"NF\",0,-1)",
+            LookupExpected::Text("p2"),
+        ),
+        (
+            "X8",
+            [Some(0.0), None, Some(1.0)],
+            "=MATCH(F1,A1:A3,0)",
+            LookupExpected::Number(1.0),
+        ),
+        (
+            "X9",
+            [Some(1.0), None, Some(2.0)],
+            "=XLOOKUP(F1,A1:A3,D1:D3,\"NF\",0,1)",
+            LookupExpected::Text("p2"),
+        ),
+        (
+            "X10",
+            [Some(1.0), None, Some(2.0)],
+            "=XLOOKUP(F1,A1:A3,D1:D3,\"NF\",0,-1)",
+            LookupExpected::Text("p2"),
+        ),
+        (
+            "X11",
+            [Some(1.0), None, Some(2.0)],
+            "=XMATCH(F1,A1:A3,0)",
+            LookupExpected::Number(2.0),
+        ),
+        (
+            "X12",
+            [Some(1.0), None, Some(2.0)],
+            "=XLOOKUP(\"\",A1:A3,D1:D3,\"NF\",0,1)",
+            LookupExpected::Text("NF"),
+        ),
+        (
+            "X13",
+            [Some(1.0), None, Some(2.0)],
+            "=MATCH(\"\",A1:A3,0)",
+            LookupExpected::Na,
+        ),
+    ];
+
+    for (label, values, formula_text, expected) in cases {
+        assert_lookup_expected(
+            evaluate_lookup_fixture(values, false, formula_text),
+            expected,
+            label,
+        );
+    }
+}
+
+#[test]
+fn corrected_blank_zero_boundary_oracle_rows() {
+    let vertical = [
+        ("B1", 2.0, "=MATCH(0,A1:A3,0)", LookupExpected::Na),
+        ("B2", 2.0, "=MATCH(F1,A1:A3,0)", LookupExpected::Na),
+        ("B3", 0.0, "=MATCH(F1,A1:A3,0)", LookupExpected::Number(3.0)),
+        ("B4", 2.0, "=XMATCH(0,A1:A3,0)", LookupExpected::Na),
+        (
+            "B5",
+            0.0,
+            "=XMATCH(F1,A1:A3,0)",
+            LookupExpected::Number(2.0),
+        ),
+        ("B6", 2.0, "=VLOOKUP(0,A1:A3,1,FALSE)", LookupExpected::Na),
+        (
+            "B7",
+            0.0,
+            "=VLOOKUP(F1,A1:A3,1,FALSE)",
+            LookupExpected::Number(0.0),
+        ),
+        (
+            "B8",
+            2.0,
+            "=XLOOKUP(0,A1:A3,A1:A3,\"NF\",0,1)",
+            LookupExpected::Text("NF"),
+        ),
+        (
+            "B9",
+            2.0,
+            "=XLOOKUP(0,A1:A3,A1:A3,\"NF\",0,-1)",
+            LookupExpected::Text("NF"),
+        ),
+        (
+            "B10",
+            2.0,
+            "=XLOOKUP(F1,A1:A3,A1:A3,\"NF\",0,-1)",
+            LookupExpected::Number(0.0),
+        ),
+        (
+            "B11",
+            0.0,
+            "=XLOOKUP(F1,A1:A3,A1:A3,\"NF\",0,-1)",
+            LookupExpected::Number(0.0),
+        ),
+        (
+            "B12",
+            2.0,
+            "=XLOOKUP(0,A1:A3,A1:A3,\"NF\",2,1)",
+            LookupExpected::Text("NF"),
+        ),
+        ("B13", 2.0, "=MATCH(-0,A1:A3,0)", LookupExpected::Na),
+        (
+            "B14",
+            0.0,
+            "=MATCH(-0,A1:A3,0)",
+            LookupExpected::Number(3.0),
+        ),
+        (
+            "B15",
+            -0.0,
+            "=MATCH(F1,A1:A3,0)",
+            LookupExpected::Number(3.0),
+        ),
+    ];
+    let horizontal = [
+        ("B16", 2.0, "=HLOOKUP(0,A5:C5,1,FALSE)", LookupExpected::Na),
+        ("B17", 2.0, "=HLOOKUP(F1,A5:C5,1,FALSE)", LookupExpected::Na),
+        (
+            "B18",
+            0.0,
+            "=HLOOKUP(F1,A5:C5,1,FALSE)",
+            LookupExpected::Number(0.0),
+        ),
+        ("B19", 2.0, "=MATCH(F1,A5:C5,0)", LookupExpected::Na),
+        (
+            "B20",
+            0.0,
+            "=MATCH(F1,A5:C5,0)",
+            LookupExpected::Number(3.0),
+        ),
+    ];
+
+    for (label, third, formula_text, expected) in vertical {
+        assert_lookup_expected(
+            evaluate_lookup_fixture([Some(1.0), None, Some(third)], false, formula_text),
+            expected,
+            label,
+        );
+    }
+    for (label, third, formula_text, expected) in horizontal {
+        assert_lookup_expected(
+            evaluate_lookup_fixture([Some(1.0), None, Some(third)], true, formula_text),
+            expected,
+            label,
+        );
+    }
+}
+
+#[test]
+fn x_function_semantic_blank_scan_controls() {
+    let mut engine = engine_with_mode(FormulaPlaneMode::Off);
+    number(&mut engine, "Sheet1", 2, 1, 0.0);
+    text(&mut engine, "Sheet1", 4, 1, "");
+    for row in 1..=4 {
+        text(&mut engine, "Sheet1", row, 4, &format!("p{row}"));
+    }
+
+    number(&mut engine, "Sheet1", 10, 2, 0.0);
+    text(&mut engine, "Sheet1", 10, 4, "");
+    for col in 1..=4 {
+        text(&mut engine, "Sheet1", 11, col, &format!("p{col}"));
+    }
+
+    for row in 1..=3 {
+        text(&mut engine, "Sheet1", row, 12, &format!("p{row}"));
+    }
+
+    let cases = [
+        (
+            "XMATCH exact first blank",
+            "=XMATCH(F1,A1:A4,0,1)",
+            LookupExpected::Number(1.0),
+        ),
+        (
+            "XMATCH exact last blank",
+            "=XMATCH(F1,A1:A4,0,-1)",
+            LookupExpected::Number(3.0),
+        ),
+        (
+            "XMATCH wildcard first blank",
+            "=XMATCH(F1,A1:A4,2,1)",
+            LookupExpected::Number(1.0),
+        ),
+        (
+            "XMATCH wildcard last blank",
+            "=XMATCH(F1,A1:A4,2,-1)",
+            LookupExpected::Number(3.0),
+        ),
+        (
+            "XLOOKUP exact first blank",
+            "=XLOOKUP(F1,A1:A4,D1:D4,\"NF\",0,1)",
+            LookupExpected::Text("p1"),
+        ),
+        (
+            "XLOOKUP exact last blank",
+            "=XLOOKUP(F1,A1:A4,D1:D4,\"NF\",0,-1)",
+            LookupExpected::Text("p3"),
+        ),
+        (
+            "XLOOKUP wildcard first blank",
+            "=XLOOKUP(F1,A1:A4,D1:D4,\"NF\",2,1)",
+            LookupExpected::Text("p1"),
+        ),
+        (
+            "XLOOKUP wildcard last blank",
+            "=XLOOKUP(F1,A1:A4,D1:D4,\"NF\",2,-1)",
+            LookupExpected::Text("p3"),
+        ),
+        (
+            "XLOOKUP numeric zero",
+            "=XLOOKUP(0,A1:A4,D1:D4,\"NF\",0,1)",
+            LookupExpected::Text("p2"),
+        ),
+        (
+            "XLOOKUP empty text",
+            "=XLOOKUP(\"\",A1:A4,D1:D4,\"NF\",0,1)",
+            LookupExpected::Text("p4"),
+        ),
+        (
+            "XMATCH numeric zero",
+            "=XMATCH(0,A1:A4,0,1)",
+            LookupExpected::Number(2.0),
+        ),
+        (
+            "XMATCH empty text",
+            "=XMATCH(\"\",A1:A4,0,1)",
+            LookupExpected::Number(4.0),
+        ),
+        (
+            "XMATCH forward alias",
+            "=XMATCH(F1,A1:A4,0,2)",
+            LookupExpected::Number(1.0),
+        ),
+        (
+            "XMATCH reverse alias",
+            "=XMATCH(F1,A1:A4,0,-2)",
+            LookupExpected::Number(3.0),
+        ),
+        (
+            "XLOOKUP forward alias",
+            "=XLOOKUP(F1,A1:A4,D1:D4,\"NF\",0,2)",
+            LookupExpected::Text("p1"),
+        ),
+        (
+            "XLOOKUP fallback alias",
+            "=XLOOKUP(F1,A1:A4,D1:D4,\"NF\",0,-2)",
+            LookupExpected::Text("p1"),
+        ),
+        (
+            "horizontal XLOOKUP first blank",
+            "=XLOOKUP(F1,A10:D10,A11:D11,\"NF\",0,1)",
+            LookupExpected::Text("p1"),
+        ),
+        (
+            "horizontal XLOOKUP last blank",
+            "=XLOOKUP(F1,A10:D10,A11:D11,\"NF\",0,-1)",
+            LookupExpected::Text("p3"),
+        ),
+        (
+            "horizontal XMATCH last blank",
+            "=XMATCH(F1,A10:D10,0,-1)",
+            LookupExpected::Number(3.0),
+        ),
+        (
+            "materialized XLOOKUP first blank",
+            "=XLOOKUP(F1,CHOOSECOLS(A1:A4,1),D1:D4,\"NF\",0,1)",
+            LookupExpected::Text("p1"),
+        ),
+        (
+            "materialized XLOOKUP last blank",
+            "=XLOOKUP(F1,CHOOSECOLS(A1:A4,1),D1:D4,\"NF\",0,-1)",
+            LookupExpected::Text("p3"),
+        ),
+        (
+            "materialized XMATCH first blank",
+            "=XMATCH(F1,CHOOSECOLS(A1:A4,1),0,1)",
+            LookupExpected::Number(1.0),
+        ),
+        (
+            "materialized XMATCH last blank",
+            "=XMATCH(F1,CHOOSECOLS(A1:A4,1),0,-1)",
+            LookupExpected::Number(3.0),
+        ),
+        (
+            "empty-view XLOOKUP first blank",
+            "=XLOOKUP(F1,K1:K3,L1:L3,\"NF\",0,1)",
+            LookupExpected::Text("p1"),
+        ),
+        (
+            "empty-view XLOOKUP last blank",
+            "=XLOOKUP(F1,K1:K3,L1:L3,\"NF\",0,-1)",
+            LookupExpected::Text("p3"),
+        ),
+        (
+            "empty-view XLOOKUP wildcard blank",
+            "=XLOOKUP(F1,K1:K3,L1:L3,\"NF\",2,1)",
+            LookupExpected::Text("p1"),
+        ),
+        (
+            "empty-view XLOOKUP numeric zero",
+            "=XLOOKUP(0,K1:K3,L1:L3,\"NF\",0,1)",
+            LookupExpected::Text("NF"),
+        ),
+        (
+            "empty-view XLOOKUP empty text",
+            "=XLOOKUP(\"\",K1:K3,L1:L3,\"NF\",0,1)",
+            LookupExpected::Text("NF"),
+        ),
+    ];
+
+    for (offset, (_, formula_text, _)) in cases.iter().enumerate() {
+        formula(&mut engine, "Sheet1", offset as u32 + 20, 14, formula_text);
+    }
+    engine.evaluate_all().unwrap();
+    for (offset, (label, _, expected)) in cases.into_iter().enumerate() {
+        let actual = engine
+            .get_cell_value("Sheet1", offset as u32 + 20, 14)
+            .expect("blank scan control result");
+        assert_lookup_expected(actual, expected, label);
+    }
+}
+
 type LookupMatrixExpectation = (u32, u32, LookupExpected, &'static str);
 
 fn blank_zero_lookup_matrix_engine(
@@ -703,12 +1117,12 @@ fn blank_zero_lookup_matrix_engine(
         (
             "XMATCH blank forward vertical",
             "=XMATCH($ZZ$1000,$A$1:$A$100,0,1)",
-            5.0,
+            1.0,
         ),
         (
             "XMATCH blank reverse vertical",
             "=XMATCH($ZZ$1000,$A$1:$A$100,0,-1)",
-            6.0,
+            7.0,
         ),
         (
             "XMATCH +0 forward horizontal",
@@ -733,12 +1147,12 @@ fn blank_zero_lookup_matrix_engine(
         (
             "XMATCH blank forward horizontal",
             "=XMATCH($ZZ$1000,$A$110:$CV$110,0,1)",
-            5.0,
+            1.0,
         ),
         (
             "XMATCH blank reverse horizontal",
             "=XMATCH($ZZ$1000,$A$110:$CV$110,0,-1)",
-            6.0,
+            7.0,
         ),
         (
             "XLOOKUP +0 forward vertical",
@@ -763,12 +1177,12 @@ fn blank_zero_lookup_matrix_engine(
         (
             "XLOOKUP blank forward vertical",
             "=XLOOKUP($ZZ$1000,$A$1:$A$100,$B$1:$B$100,-1,0,1)",
-            50.0,
+            10.0,
         ),
         (
             "XLOOKUP blank reverse vertical",
             "=XLOOKUP($ZZ$1000,$A$1:$A$100,$B$1:$B$100,-1,0,-1)",
-            60.0,
+            70.0,
         ),
         (
             "XLOOKUP +0 forward horizontal",
@@ -793,12 +1207,12 @@ fn blank_zero_lookup_matrix_engine(
         (
             "XLOOKUP blank forward horizontal",
             "=XLOOKUP($ZZ$1000,$A$110:$CV$110,$A$111:$CV$111,-1,0,1)",
-            50.0,
+            10.0,
         ),
         (
             "XLOOKUP blank reverse horizontal",
             "=XLOOKUP($ZZ$1000,$A$110:$CV$110,$A$111:$CV$111,-1,0,-1)",
-            60.0,
+            70.0,
         ),
     ];
     let missing_cases = [
@@ -883,14 +1297,14 @@ fn blank_zero_lookup_matrix_engine(
             LookupExpected::Na,
         ),
         (
-            "XMATCH blank missing forward vertical",
+            "XMATCH blank first vertical",
             "=XMATCH($ZZ$1000,$C$1:$C$100,0,1)",
-            LookupExpected::Na,
+            LookupExpected::Number(4.0),
         ),
         (
-            "XMATCH blank missing reverse vertical",
+            "XMATCH blank last vertical",
             "=XMATCH($ZZ$1000,$C$1:$C$100,0,-1)",
-            LookupExpected::Na,
+            LookupExpected::Number(100.0),
         ),
         (
             "XMATCH +0 missing forward horizontal",
@@ -913,14 +1327,14 @@ fn blank_zero_lookup_matrix_engine(
             LookupExpected::Na,
         ),
         (
-            "XMATCH blank missing forward horizontal",
+            "XMATCH blank first horizontal",
             "=XMATCH($ZZ$1000,$A$120:$CV$120,0,1)",
-            LookupExpected::Na,
+            LookupExpected::Number(4.0),
         ),
         (
-            "XMATCH blank missing reverse horizontal",
+            "XMATCH blank last horizontal",
             "=XMATCH($ZZ$1000,$A$120:$CV$120,0,-1)",
-            LookupExpected::Na,
+            LookupExpected::Number(100.0),
         ),
         (
             "XLOOKUP +0 missing forward vertical",
@@ -943,14 +1357,14 @@ fn blank_zero_lookup_matrix_engine(
             LookupExpected::Text("NF"),
         ),
         (
-            "XLOOKUP blank missing forward vertical",
+            "XLOOKUP blank first vertical",
             "=XLOOKUP($ZZ$1000,$C$1:$C$100,$D$1:$D$100,\"NF\",0,1)",
-            LookupExpected::Text("NF"),
+            LookupExpected::Number(40.0),
         ),
         (
-            "XLOOKUP blank missing reverse vertical",
+            "XLOOKUP blank last vertical",
             "=XLOOKUP($ZZ$1000,$C$1:$C$100,$D$1:$D$100,\"NF\",0,-1)",
-            LookupExpected::Text("NF"),
+            LookupExpected::Number(1000.0),
         ),
         (
             "XLOOKUP +0 missing forward horizontal",
@@ -973,14 +1387,14 @@ fn blank_zero_lookup_matrix_engine(
             LookupExpected::Text("NF"),
         ),
         (
-            "XLOOKUP blank missing forward horizontal",
+            "XLOOKUP blank first horizontal",
             "=XLOOKUP($ZZ$1000,$A$120:$CV$120,$A$121:$CV$121,\"NF\",0,1)",
-            LookupExpected::Text("NF"),
+            LookupExpected::Number(40.0),
         ),
         (
-            "XLOOKUP blank missing reverse horizontal",
+            "XLOOKUP blank last horizontal",
             "=XLOOKUP($ZZ$1000,$A$120:$CV$120,$A$121:$CV$121,\"NF\",0,-1)",
-            LookupExpected::Text("NF"),
+            LookupExpected::Number(1000.0),
         ),
     ];
 
@@ -1011,23 +1425,7 @@ fn assert_blank_zero_lookup_matrix(
         let actual = engine
             .get_cell_value("Sheet1", row, col)
             .unwrap_or_else(|| panic!("missing result for {label}"));
-        match expected_value {
-            LookupExpected::Number(expected_number) => {
-                let actual_number = match actual {
-                    LiteralValue::Number(number) => number,
-                    LiteralValue::Int(number) => number as f64,
-                    other => panic!("{label}: expected {expected_number}, got {other:?}"),
-                };
-                assert_eq!(actual_number, expected_number, "{label}");
-            }
-            LookupExpected::Na => assert!(
-                matches!(actual, LiteralValue::Error(ref error) if error.kind == ExcelErrorKind::Na),
-                "{label}: expected #N/A, got {actual:?}"
-            ),
-            LookupExpected::Text(expected_text) => {
-                assert_eq!(actual, LiteralValue::Text(expected_text.into()), "{label}")
-            }
-        }
+        assert_lookup_expected(actual, expected_value, label);
     }
 }
 
@@ -1043,11 +1441,11 @@ fn blank_zero_exact_lookup_matrix_is_identical_cold_and_warm() {
         if cache_max_bytes == 0 {
             assert_eq!(first.builds, 0, "{first:?}");
             assert_eq!(first.hits, 0, "{first:?}");
-            assert_eq!(first.misses, 180, "{first:?}");
-            assert_eq!(first.skipped_cap, 180, "{first:?}");
+            assert_eq!(first.misses, 160, "{first:?}");
+            assert_eq!(first.skipped_cap, 160, "{first:?}");
         } else {
             assert_eq!(first.builds, 8, "{first:?}");
-            assert_eq!(first.hits, 148, "{first:?}");
+            assert_eq!(first.hits, 128, "{first:?}");
             assert_eq!(first.entries_count, 8, "{first:?}");
         }
 
@@ -1060,14 +1458,14 @@ fn blank_zero_exact_lookup_matrix_is_identical_cold_and_warm() {
         assert_eq!(warm.builds, 0, "{warm:?}");
         assert_eq!(
             warm.misses,
-            if cache_max_bytes == 0 { 180 } else { 0 },
+            if cache_max_bytes == 0 { 160 } else { 0 },
             "{warm:?}"
         );
         if cache_max_bytes == 0 {
             assert_eq!(warm.hits, 0, "{warm:?}");
-            assert_eq!(warm.skipped_cap, 180, "{warm:?}");
+            assert_eq!(warm.skipped_cap, 160, "{warm:?}");
         } else {
-            assert_eq!(warm.hits, 180, "{warm:?}");
+            assert_eq!(warm.hits, 160, "{warm:?}");
             assert_eq!(warm.entries_count, first.entries_count, "{warm:?}");
             assert_eq!(warm.bytes_in_cache, first.bytes_in_cache, "{warm:?}");
         }

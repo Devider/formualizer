@@ -71,6 +71,28 @@ pub fn super_wildcard_match(pattern: &str, text: &str) -> bool {
     super::lookup_utils::wildcard_pattern_match(pattern, text)
 }
 
+fn find_semantic_empty(
+    view: &crate::engine::range_view::RangeView<'_>,
+    len: usize,
+    vertical: bool,
+    reverse: bool,
+) -> Option<usize> {
+    let is_empty = |i| {
+        let value = if vertical {
+            view.get_cell(i, 0)
+        } else {
+            view.get_cell(0, i)
+        };
+        matches!(value, LiteralValue::Empty)
+    };
+
+    if reverse {
+        (0..len).rev().find(|&i| is_empty(i))
+    } else {
+        (0..len).find(|&i| is_empty(i))
+    }
+}
+
 /* ───────────────────────── XLOOKUP() ───────────────────────── */
 
 #[derive(Debug)]
@@ -82,7 +104,7 @@ pub struct XLookupFn;
 ///
 /// # Remarks
 /// - Defaults: `match_mode=0` (exact), `search_mode=1` (first-to-last).
-/// - Exact matching never selects a blank candidate. A blank lookup value retains numeric-zero semantics and can select a real numeric zero, but not blank, text, or boolean candidates.
+/// - In exact and wildcard modes, a blank lookup value selects only a blank candidate; numeric zero and empty text remain distinct.
 /// - `if_not_found` is optional; if omitted and no match exists, returns `#N/A`.
 /// - `match_mode`: `0` exact, `-1` exact-or-next-smaller, `1` exact-or-next-larger, `2` wildcard.
 /// - `search_mode`: `1` forward, `-1` reverse. Other modes are accepted with current fallback behavior.
@@ -314,9 +336,10 @@ impl Function for XLookupFn {
 
         let mut found: Option<usize> = None;
         let needle = lookup_value;
-        let prepared_matcher = PreparedLookupMatcher::new(&needle, wildcard, _ctx.date_system());
         if match_mode == 0 || wildcard {
-            if match_mode == 0 && search_mode == 1 && lookup_rows > 0 && lookup_cols > 0 {
+            if matches!(needle, LiteralValue::Empty) {
+                found = find_semantic_empty(&lookup_view, lookup_len, vertical, search_mode == -1);
+            } else if match_mode == 0 && search_mode == 1 && lookup_rows > 0 && lookup_cols > 0 {
                 let axis = if vertical {
                     LookupAxis::ColumnInView(0)
                 } else {
@@ -340,6 +363,8 @@ impl Function for XLookupFn {
                     _ctx.date_system(),
                 )?;
             } else if search_mode == -1 {
+                let prepared_matcher =
+                    PreparedLookupMatcher::new(&needle, wildcard, _ctx.date_system());
                 for i in (0..lookup_len).rev() {
                     let cand = if vertical {
                         lookup_view.get_cell(i, 0)
@@ -354,6 +379,8 @@ impl Function for XLookupFn {
             } else {
                 // Fallback linear scan (also used when the lookup view is empty and
                 // we are treating missing cells as Empty).
+                let prepared_matcher =
+                    PreparedLookupMatcher::new(&needle, wildcard, _ctx.date_system());
                 for i in 0..lookup_len {
                     let cand = if vertical {
                         lookup_view.get_cell(i, 0)
@@ -480,7 +507,7 @@ pub struct XMatchFn;
 ///
 /// # Remarks
 /// - Defaults: `match_mode=0` (exact), `search_mode=1` (first-to-last).
-/// - Exact matching never selects a blank candidate. A blank lookup value retains numeric-zero semantics and can select a real numeric zero, but not blank, text, or boolean candidates.
+/// - In exact and wildcard modes, a blank lookup value selects only a blank candidate; numeric zero and empty text remain distinct.
 /// - `match_mode`: `0` exact, `-1` exact-or-next-smaller, `1` exact-or-next-larger, `2` wildcard.
 /// - `search_mode`: `1` forward, `-1` reverse, `2` ascending binary intent, `-2` descending binary intent.
 /// - `lookup_array` must be a single row or single column, otherwise returns `#VALUE!`.
@@ -665,13 +692,19 @@ impl Function for XMatchFn {
 
         let wildcard = match_mode == 2;
         let needle = lookup_value;
-        let prepared_matcher = PreparedLookupMatcher::new(&needle, wildcard, _ctx.date_system());
 
         let mut found: Option<usize> = None;
 
         if match_mode == 0 || wildcard {
             // Exact match or wildcard match
-            if search_mode == 1 || search_mode == 2 {
+            if matches!(needle, LiteralValue::Empty) {
+                found = find_semantic_empty(
+                    &lookup_view,
+                    lookup_len,
+                    vertical,
+                    search_mode == -1 || search_mode == -2,
+                );
+            } else if search_mode == 1 || search_mode == 2 {
                 // Forward search (first to last) or binary ascending (treated as forward for exact)
                 if lookup_rows > 0 && lookup_cols > 0 {
                     found = super::lookup_utils::find_exact_index_in_view(
@@ -683,6 +716,8 @@ impl Function for XMatchFn {
                 }
             } else if search_mode == -1 || search_mode == -2 {
                 // Reverse search (last to first) or binary descending (treated as reverse for exact)
+                let prepared_matcher =
+                    PreparedLookupMatcher::new(&needle, wildcard, _ctx.date_system());
                 for i in (0..lookup_len).rev() {
                     let cand = if vertical {
                         lookup_view.get_cell(i, 0)
@@ -696,6 +731,8 @@ impl Function for XMatchFn {
                 }
             } else {
                 // Fallback linear scan
+                let prepared_matcher =
+                    PreparedLookupMatcher::new(&needle, wildcard, _ctx.date_system());
                 for i in 0..lookup_len {
                     let cand = if vertical {
                         lookup_view.get_cell(i, 0)
@@ -3601,7 +3638,7 @@ mod tests {
     }
 
     #[test]
-    fn modern_reverse_array_lookups_only_match_numeric_zero_candidates() {
+    fn modern_reverse_array_numeric_zero_only_matches_numeric_zero_candidates() {
         let wb = TestWorkbook::new()
             .with_function(Arc::new(XLookupFn))
             .with_function(Arc::new(XMatchFn));
@@ -3611,11 +3648,7 @@ mod tests {
         let zero_mode = lit(LiteralValue::Int(0));
         let reverse = lit(LiteralValue::Int(-1));
         let not_found = lit(LiteralValue::Text("NF".into()));
-        let needles = [
-            LiteralValue::Number(0.0),
-            LiteralValue::Number(-0.0),
-            LiteralValue::Empty,
-        ];
+        let needles = [LiteralValue::Number(0.0), LiteralValue::Number(-0.0)];
 
         for vertical in [false, true] {
             let candidates = vec![
