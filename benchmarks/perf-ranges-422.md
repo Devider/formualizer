@@ -76,15 +76,24 @@ Exact exclusions: baseline/A instrumented builds lack the appended `bounded_proj
 
 ## Reproduction
 
-Build first, then measure without overlapping builds. Raw captures and binaries stay local; inspect any text before sharing it. From the candidate checkout, this creates a fresh baseline with only the example/stanza and uses **distinct target directories**; never trust cross-worktree artifact reuse based on source mtimes.
+Build first, then measure without overlapping builds. Raw captures and binaries stay local; inspect any text before sharing it. Retrieve the measured candidate, fixture, and removed patches from immutable commit `086a915e`; use **distinct target directories** and never trust cross-worktree artifact reuse based on source mtimes.
 
 ```bash
 set -eu
-fixed=$PWD
 out=$(mktemp -d)
+fixed="$out/program-ranges-fixed"
 base="$out/program-ranges-baseline"
+mkdir -p "$out/assets"
+git worktree add --detach "$fixed" 086a915eb9ab29b638d3ddb7aa178d1512d9c06c
 git worktree add --detach "$base" 8a912b50a086a8cdb0001ea10b6468073aa446ca
-cp crates/formualizer-eval/examples/range_projection_probe.rs "$base/crates/formualizer-eval/examples/"
+git show 086a915eb9ab29b638d3ddb7aa178d1512d9c06c:crates/formualizer-eval/examples/range_projection_probe.rs \
+  > "$base/crates/formualizer-eval/examples/range_projection_probe.rs"
+git show 086a915eb9ab29b638d3ddb7aa178d1512d9c06c:crates/formualizer-eval/src/engine/tests/perf_ranges.rs \
+  > "$out/assets/perf_ranges.rs"
+git show 086a915eb9ab29b638d3ddb7aa178d1512d9c06c:benchmarks/perf-ranges-422-baseline.patch \
+  > "$out/assets/perf-ranges-422-baseline.patch"
+git show 086a915eb9ab29b638d3ddb7aa178d1512d9c06c:benchmarks/perf-ranges-422-a-only.patch \
+  > "$out/assets/perf-ranges-422-a-only.patch"
 cat >> "$base/crates/formualizer-eval/Cargo.toml" <<'TOML'
 
 [[example]]
@@ -92,10 +101,10 @@ name = "range_projection_probe"
 path = "examples/range_projection_probe.rs"
 required-features = ["test-support"]
 TOML
-(cd "$base" && CARGO_TARGET_DIR="$out/target-baseline" cargo +1.93.0 build \
+(cd "$base" && RUSTC_WRAPPER= CARGO_TARGET_DIR="$out/target-baseline" cargo +1.93.0 build \
   -p formualizer-eval --example range_projection_probe --features test-support --release -j4)
-CARGO_TARGET_DIR="$out/target-fixed" cargo +1.93.0 build \
-  -p formualizer-eval --example range_projection_probe --features test-support --release -j4
+(cd "$fixed" && RUSTC_WRAPPER= CARGO_TARGET_DIR="$out/target-fixed" cargo +1.93.0 build \
+  -p formualizer-eval --example range_projection_probe --features test-support --release -j4)
 cp "$out/target-baseline/release/examples/range_projection_probe" "$out/production-baseline"
 cp "$out/target-fixed/release/examples/range_projection_probe" "$out/production-fixed"
 "$out/production-baseline" --validate
@@ -108,6 +117,6 @@ done
 uv run --no-project python3 benchmarks/summarize-perf-ranges.py "$out"/production-*.txt
 ```
 
-For mechanism reproduction, apply `perf-ranges-422-baseline.patch` to that baseline and copy `crates/formualizer-eval/src/engine/tests/perf_ranges.rs` from the candidate into its matching path. The patch adds only test counters and the child-module declaration, reusing the existing allocator. Build/copy its eval lib test executable with `cargo +1.93.0 test -p formualizer-eval --lib --release --no-run -j4`. Then apply `perf-ranges-422-a-only.patch` on top for **A only** (bounded discovery, not projection), build/copy into a distinct A target. Build/copy the candidate for A+B in another target. The A-only patch intentionally changes the experimental variant's cursor; it is not an instrumentation-only patch or a second proposed production fix.
+For mechanism reproduction, apply `$out/assets/perf-ranges-422-baseline.patch` to that baseline and copy `$out/assets/perf_ranges.rs` into its matching path. The patch adds only test counters and the child-module declaration, reusing the historical allocator. Build/copy its eval lib test executable with Rust 1.93, `RUSTC_WRAPPER=` and its own target directory. Then apply `$out/assets/perf-ranges-422-a-only.patch` on top for **A only** (bounded discovery, not projection), building into a distinct A target. Build/copy immutable candidate `086a915e` for A+B in another target. The A-only patch intentionally changes the experimental variant's cursor; it is not an instrumentation-only patch or a second proposed production fix.
 
 Validate each executable with `range_probe_fixtures_validate --test-threads=1`. After all builds finish, use `FZ_RANGES_SAMPLES=7 <executable> range_release_probe --ignored --nocapture --test-threads=1` in baseline/A/AB/AB/A/baseline order, saving names `instrumented-baseline-1.txt`, `instrumented-a-1.txt`, `instrumented-ab-1.txt`, etc. The summarizer accepts those files and `--work` emits per-iteration median allocation/work counts. It handles the libtest-prefixed first record. Neither patches nor report contain raw captures, binaries, archives or environment dumps.

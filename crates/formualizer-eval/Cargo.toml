@@ -123,6 +123,11 @@ benchmark_internal = []
 test-support = []
 
 [[example]]
+name = "perf_tranche_probe"
+path = "examples/perf_tranche_probe.rs"
+required-features = ["test-support"]
+
+[[example]]
 name = "range_projection_probe"
 path = "examples/range_projection_probe.rs"
 required-features = ["test-support"]

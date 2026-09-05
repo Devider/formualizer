@@ -1,8 +1,7 @@
-//! Shared baseline/candidate fixtures. Timing runs require an exclusive resource window.
-use super::{config, dirty, measure};
+//! Correctness fixtures retained from the historical range probe.
 use crate::arrow_store::{ArrowSheet, IngestBuilder, OverlayValue};
 use crate::engine::range_view::{RangeView, range_work};
-use crate::engine::{Engine, FormulaPlaneMode};
+use crate::engine::{Engine, EvalConfig, FormulaPlaneMode};
 use crate::test_workbook::TestWorkbook;
 use arrow_array::Array;
 use formualizer_common::{DateSystem, LiteralValue};
@@ -17,6 +16,28 @@ enum Read {
     Errors,
     Sum,
     Count,
+}
+
+fn config(mode: FormulaPlaneMode, threads: usize) -> EvalConfig {
+    EvalConfig {
+        enable_parallel: threads > 1,
+        max_threads: Some(threads),
+        formula_plane_mode: mode,
+        arrow_storage_enabled: true,
+        delta_overlay_enabled: true,
+        write_formula_overlay_enabled: true,
+        ..EvalConfig::default()
+    }
+}
+
+fn dirty(engine: &mut Engine<TestWorkbook>) {
+    let ids: Vec<_> = engine.graph.vertices_with_formulas().collect();
+    for id in ids {
+        engine.graph.mark_vertex_dirty(id);
+    }
+    engine.graph.mark_all_formula_spans_dirty(
+        crate::engine::graph::WholeSpanDirtyReason::GlobalInvalidation,
+    );
 }
 
 fn read(view: &RangeView<'_>, mode: Read) -> f64 {
@@ -136,61 +157,25 @@ fn scalar_oracle(view: &RangeView<'_>, mode: Read) -> f64 {
     total
 }
 
-fn observation(timed: bool, f: impl FnOnce()) -> (u128, usize, usize) {
-    if timed {
-        measure(f)
-    } else {
-        f();
-        (0, 0, 0)
-    }
-}
-
 fn direct_case(
     name: &str,
     make: impl Fn() -> ArrowSheet,
     bounds: impl Fn(&ArrowSheet) -> (usize, usize, usize, usize),
     mode: Read,
-    timed: bool,
-    samples: usize,
-    repeats: usize,
 ) {
-    for sample in 0..samples {
-        let sheet = make();
-        let (sr, sc, er, ec) = bounds(&sheet);
-        let view = sheet.range_view(sr, sc, er, ec);
-        let expected = scalar_oracle(&view, mode);
-        for phase in ["cold", "warm"] {
-            let iterations = if phase == "cold" { 1 } else { repeats };
-            range_work::begin();
-            let mut answer = 0.0;
-            let measured = observation(timed, || {
-                for _ in 0..iterations {
-                    answer += read(black_box(&view), mode);
-                }
-            });
-            let work = range_work::take();
-            assert_eq!(
-                answer,
-                expected * iterations as f64,
-                "{name}/{mode:?}/{phase}"
-            );
-            if timed {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "family":"direct", "case":name, "mode":format!("{mode:?}"), "phase":phase,
-                        "sample":sample, "iterations":iterations, "ns":measured.0,
-                        "allocations":measured.1, "allocated_bytes":measured.2, "work":work,
-                        "bounds":[sr,sc,er,ec], "sheet_rows":sheet.nrows, "chunks":sheet.chunk_starts.len(),
-                        "physical_chunks":sheet.columns.iter().map(|c| c.total_chunk_count()).sum::<usize>()
-                    })
-                );
-            }
-        }
+    let sheet = make();
+    let (sr, sc, er, ec) = bounds(&sheet);
+    let view = sheet.range_view(sr, sc, er, ec);
+    let expected = scalar_oracle(&view, mode);
+    for phase in ["cold", "warm"] {
+        range_work::begin();
+        let answer = read(black_box(&view), mode);
+        let _work = range_work::take();
+        assert_eq!(answer, expected, "{name}/{mode:?}/{phase}");
     }
 }
 
-fn direct(timed: bool, samples: usize) {
+fn direct() {
     for (chunk_rows, chunks) in [(32768, 1), (32768, 32), (256, 32), (256, 4096)] {
         for position in ["head", "tail", "oob", "cross"] {
             for mode in [Read::Generic, Read::First, Read::Numbers, Read::Errors] {
@@ -207,9 +192,6 @@ fn direct(timed: bool, samples: usize) {
                         (start, 0, start + 7, 0)
                     },
                     mode,
-                    timed,
-                    samples,
-                    if timed { 128 } else { 1 },
                 );
             }
         }
@@ -221,9 +203,6 @@ fn direct(timed: bool, samples: usize) {
                 || dense(chunk_rows, mixed),
                 |_| (0, 0, 32767, 7),
                 mode,
-                timed,
-                samples,
-                if timed { 8 } else { 1 },
             );
         }
     }
@@ -241,9 +220,6 @@ fn direct(timed: bool, samples: usize) {
                     )
                 },
                 Read::Sum,
-                timed,
-                samples,
-                if timed { 4 } else { 1 },
             );
         }
     }
@@ -277,14 +253,11 @@ fn direct(timed: bool, samples: usize) {
             },
             |_| (0, 0, 7, 0),
             Read::Sum,
-            timed,
-            samples,
-            if timed { 128 } else { 1 },
         );
     }
 }
 
-fn engine(timed: bool, samples: usize) {
+fn engine() {
     for family in ["sum-count", "lookup"] {
         for index_enabled in [false, true] {
             for chunk_rows in [32768, 256] {
@@ -318,12 +291,10 @@ fn engine(timed: bool, samples: usize) {
                         .set_cell_formula("Results", row as u32 + 1, 1, parse(formula).unwrap())
                         .unwrap();
                 }
-                for sample in 0..samples.max(4) {
+                for sample in 0..4 {
                     dirty(&mut engine);
                     range_work::begin();
-                    let measured = observation(timed, || {
-                        engine.evaluate_all().unwrap();
-                    });
+                    engine.evaluate_all().unwrap();
                     let work = range_work::take();
                     if family == "sum-count" {
                         for (row, expected) in [(1, (32761 + 32768) as f64 * 4.0), (2, 8.0)] {
@@ -352,19 +323,6 @@ fn engine(timed: bool, samples: usize) {
                             assert_eq!(work.segments, 0);
                         }
                     }
-                    if timed {
-                        let report = engine.last_lookup_index_cache_report();
-                        println!(
-                            "{}",
-                            serde_json::json!({
-                                "family":"engine", "case":family, "index_enabled":index_enabled, "chunk_rows":chunk_rows,
-                                "sample":sample, "ns":measured.0, "allocations":measured.1,
-                                "allocated_bytes":measured.2, "work":work,
-                                "lookup_builds":report.builds, "lookup_hits":report.hits,
-                                "lookup_skipped_cap":report.skipped_cap,
-                            })
-                        );
-                    }
                 }
             }
         }
@@ -373,22 +331,6 @@ fn engine(timed: bool, samples: usize) {
 
 #[test]
 fn range_probe_fixtures_validate() {
-    direct(false, 1);
-    engine(false, 1);
-}
-
-#[test]
-#[ignore = "exclusive release measurement window required"]
-fn range_release_probe() {
-    let samples = std::env::var("FZ_RANGES_SAMPLES")
-        .ok()
-        .map(|s| s.parse().unwrap())
-        .unwrap_or(7);
-    let family = std::env::var("FZ_RANGES_FAMILY").unwrap_or_default();
-    if family.is_empty() || family == "direct" {
-        direct(true, samples);
-    }
-    if family.is_empty() || family == "engine" {
-        engine(true, samples);
-    }
+    direct();
+    engine();
 }

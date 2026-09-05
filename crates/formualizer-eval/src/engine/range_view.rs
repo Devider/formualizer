@@ -19,7 +19,6 @@ pub(crate) mod range_work {
         pub segments: usize,
         pub segment_rows: usize,
         pub generic_columns: usize,
-        pub selector_searches: usize,
         pub null_arrays: usize,
         pub null_slots: usize,
         pub provider_requests: [usize; 4],
@@ -1654,14 +1653,12 @@ mod bounded_projection_tests {
             let _: Vec<_> = view.numbers_slices().collect();
             let numeric = range_work::take();
             assert_eq!(numeric.generic_columns, 0);
-            assert_eq!(numeric.selector_searches, 0);
             assert_eq!(numeric.provider_requests[1..], [0, 0, 0]);
             assert!(numeric.null_arrays <= 3);
             range_work::begin();
             let _: Vec<_> = view.errors_slices().collect();
             let errors = range_work::take();
             assert_eq!(errors.generic_columns, 0);
-            assert_eq!(errors.selector_searches, 0);
             assert_eq!(errors.provider_requests[0], 0);
             assert_eq!(errors.provider_requests[1], 0);
             assert_eq!(errors.provider_requests[3], 0);

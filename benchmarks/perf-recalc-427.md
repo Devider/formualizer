@@ -121,15 +121,18 @@ All raw outputs, full manifests, executables and machine/environment dumps remai
 Build everything before measuring, with no RUSTFLAGS/profile overrides. Separate baseline/fixed targets prevent source/cache confusion:
 
 ```bash
-assets=$PWD
 out=$(mktemp -d)
 fixed=$out/fixed
+mkdir -p "$out/assets"
+git show 9a2525a5a2007c99d31cdcc7935b352fd7e3f07e:benchmarks/perf-recalc-427-baseline.patch \
+  > "$out/assets/perf-recalc-427-baseline.patch"
 git worktree add --detach "$fixed" 4eee5aa309aa6c797aa70312c27290e24c1c3c9c
 git worktree add --detach "$out/baseline" 8f7c7338ee0b2bdecbcf3e681cc1a92a7236dc14
-git -C "$out/baseline" apply "$assets/benchmarks/perf-recalc-427-baseline.patch"
-cp "$fixed/crates/formualizer-eval/examples/recalc_reuse.rs" \
-   "$fixed/crates/formualizer-eval/examples/recalc_invalidation.rs" \
-   "$out/baseline/crates/formualizer-eval/examples/"
+git -C "$out/baseline" apply "$out/assets/perf-recalc-427-baseline.patch"
+git show 4eee5aa309aa6c797aa70312c27290e24c1c3c9c:crates/formualizer-eval/examples/recalc_reuse.rs \
+  > "$out/baseline/crates/formualizer-eval/examples/recalc_reuse.rs"
+git show 4eee5aa309aa6c797aa70312c27290e24c1c3c9c:crates/formualizer-eval/examples/recalc_invalidation.rs \
+  > "$out/baseline/crates/formualizer-eval/examples/recalc_invalidation.rs"
 for side in baseline fixed; do
   source=$fixed
   if [ "$side" = baseline ]; then source=$out/baseline; fi

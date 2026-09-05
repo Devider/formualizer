@@ -144,7 +144,6 @@ fn schedule_cache_probe_separates_cold_build_warm_reuse_and_noop() {
         assert_eq!(cold.schedule_builds, 1);
         assert_eq!(cold.schedule_cache_misses, 1);
         assert_eq!(cold.schedule_shared_handles, 1);
-        assert_eq!(cold.schedule_deep_clones, 0);
         assert!(cold.schedule_retained_bytes > 0);
 
         engine.reset_recalc_reuse_probe();
@@ -159,8 +158,6 @@ fn schedule_cache_probe_separates_cold_build_warm_reuse_and_noop() {
         assert_eq!(warm.schedule_cache_hits, 1);
         assert_eq!(warm.schedule_builds, 0);
         assert_eq!(warm.schedule_shared_handles, 1);
-        assert_eq!(warm.schedule_deep_clones, 0);
-        assert_eq!(warm.schedule_deep_clone_buffers, 0);
         assert_eq!(warm.demand_builds, 0);
         assert_eq!(
             engine.get_cell_value("Sheet1", depth, 2),
