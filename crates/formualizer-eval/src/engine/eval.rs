@@ -2055,9 +2055,6 @@ pub struct RecalcReuseProbe {
     pub schedule_cache_misses: usize,
     pub schedule_cache_ineligible: usize,
     pub schedule_builds: usize,
-    pub schedule_deep_clones: usize,
-    pub schedule_deep_clone_buffers: usize,
-    pub schedule_deep_clone_bytes: usize,
     pub schedule_shared_handles: usize,
     pub schedule_retained_bytes: usize,
     pub legacy_target_requests: usize,
@@ -2070,45 +2067,25 @@ pub struct RecalcReuseProbe {
 }
 
 #[cfg(any(test, feature = "benchmark_internal"))]
-fn schedule_probe_heap_layout(
-    schedule: &crate::engine::Schedule,
-    capacity: bool,
-) -> (usize, usize) {
-    fn vector_layout<T>(values: &Vec<T>, capacity: bool) -> (usize, usize) {
-        let entries = if capacity {
-            values.capacity()
-        } else {
-            values.len()
-        };
-        (
-            entries * std::mem::size_of::<T>(),
-            usize::from(entries != 0),
-        )
+fn schedule_probe_retained_bytes(schedule: &crate::engine::Schedule) -> usize {
+    fn vector_bytes<T>(values: &Vec<T>) -> usize {
+        values.capacity() * std::mem::size_of::<T>()
     }
-    let mut bytes = 0;
-    let mut buffers = 0;
-    for (next_bytes, next_buffers) in [
-        vector_layout(&schedule.units, capacity),
-        vector_layout(&schedule.layers, capacity),
-        vector_layout(&schedule.cycles, capacity),
+
+    [
+        vector_bytes(&schedule.units),
+        vector_bytes(&schedule.layers),
+        vector_bytes(&schedule.cycles),
     ]
     .into_iter()
     .chain(
         schedule
             .layers
             .iter()
-            .map(|layer| vector_layout(&layer.vertices, capacity)),
+            .map(|layer| vector_bytes(&layer.vertices)),
     )
-    .chain(
-        schedule
-            .cycles
-            .iter()
-            .map(|cycle| vector_layout(cycle, capacity)),
-    ) {
-        bytes += next_bytes;
-        buffers += next_buffers;
-    }
-    (bytes, buffers)
+    .chain(schedule.cycles.iter().map(vector_bytes))
+    .sum()
 }
 
 #[derive(Debug, Clone)]
@@ -2552,7 +2529,7 @@ impl RecalcPlan {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) mod criteria_mask_test_hooks {
     use std::cell::Cell;
 
@@ -5900,6 +5877,26 @@ where
         self.graph.set_sheet_index_mode(mode);
     }
 
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn mark_all_formulas_dirty_for_test(&mut self) {
+        self.mark_all_formula_vertices_dirty();
+        self.graph
+            .mark_all_formula_spans_dirty(WholeSpanDirtyReason::GlobalInvalidation);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn take_criteria_mask_work_for_test() -> (usize, usize) {
+        criteria_mask_test_hooks::take_mask_work()
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn lookup_index_cache_report_for_test(&self) -> LookupIndexCacheReport {
+        self.lookup_index_cache.report()
+    }
+
     #[cfg(any(test, feature = "benchmark_internal"))]
     #[doc(hidden)]
     pub fn reset_recalc_reuse_probe(&mut self) {
@@ -5915,7 +5912,7 @@ where
                 + cached.candidate_vertices.capacity() * std::mem::size_of::<VertexId>()
                 + std::mem::size_of::<crate::engine::Schedule>()
                 + 2 * std::mem::size_of::<usize>()
-                + schedule_probe_heap_layout(&cached.schedule, true).0;
+                + schedule_probe_retained_bytes(&cached.schedule);
         }
         probe
     }
@@ -26260,7 +26257,7 @@ where
         col_in_view: usize,
         pred: &crate::args::CriteriaPredicate,
     ) -> Option<std::sync::Arc<arrow_array::BooleanArray>> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         criteria_mask_test_hooks::note_mask(view.dims().0);
         if view.dims().1 == 0 {
             return None;

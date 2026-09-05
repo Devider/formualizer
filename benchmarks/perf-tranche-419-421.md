@@ -10,7 +10,7 @@ Baseline: `2a8303d95acf2881c539e3700f7b8effc2e7bd35`. This tranche addresses #41
 
 ## Method
 
-The ignored `engine::tests::perf_tranche::release_probe` is a **cfg(test) release probe**, not a production executable or Criterion benchmark. It uses actual Engine Arrow storage and the Engine criteria/index paths, with an empty TestWorkbook as resolver. The thread-local allocation counter measures requested allocation/reallocation bytes, not peak/live memory. Parallel Engine allocation counts cover only the calling thread; the standalone registry probe sums its worker counters. Instrumentation overhead is present in both builds.
+The measured `engine::tests::perf_tranche::release_probe` was a **cfg(test) release probe**, not a production executable or Criterion benchmark. Its maintained adaptation is the opt-in `perf_tranche_probe` example behind `test-support`, which isolates the process-local allocator from ordinary library tests. It uses actual Engine Arrow storage and the Engine criteria/index paths, with an empty TestWorkbook as resolver. The thread-local allocation counter measures requested allocation/reallocation bytes, not peak/live memory. Parallel Engine allocation counts cover only the calling thread; the standalone registry probe sums its worker counters. Instrumentation overhead is present in both builds.
 
 Rust 1.93.0, default eval features (`system-clock`), release optimization with repository `lto=true`, `codegen-units=1`; no profile/RUSTFLAGS overrides. Linux x86_64, Ryzen 9 3900XT, 12 cores/24 threads. These are shared-host observations, with unrelated rendering workloads and no CPU pinning. No benchmarks overlap our builds. Final order was baseline/fixed/fixed/baseline, seven samples per run. Warm criteria/Engine distributions exclude sample zero (12 samples); registry uses 14 samples. Lookup distributions use medians of late cycles 4-15 per run/sample/needle position, then summarize those 14 medians. IQRs below are descriptive, not confidence intervals. Cold/setup/edit-only criteria distributions have only two observations.
 
@@ -60,20 +60,27 @@ Raw captures and compiled probe executables are local-only artifacts, not reposi
 
 The baseline instrumentation patch SHA-256 is `a8fbf4f93b8e2edd29a54a6bf37a8a671f902e20aefcc5350de4693ac864a8b7`.
 
-From the fixed checkout, build/copy each executable before rebuilding the other source. The emitted executable filename can vary with features/toolchain.
+Retrieve both sides and the removed reproduction assets from immutable commits; do not copy the fixture from a newer checkout. Build into separate target directories. The emitted executable filename can vary with features/toolchain.
 
 ```bash
-fix=$PWD
 out=/tmp/formualizer-perf-reproduce
-mkdir -p "$out"
-export CARGO_TARGET_DIR="$out/target"
-cargo +1.93.0 test -p formualizer-eval --lib --release --no-run -j 4
+fixed_source="$out/fixed-source"
+baseline_source="$out/baseline-source"
+mkdir -p "$out/assets"
+git show 8a912b50a086a8cdb0001ea10b6468073aa446ca:benchmarks/perf-tranche-419-421-baseline.patch \
+  > "$out/assets/perf-tranche-419-421-baseline.patch"
+git show 8a912b50a086a8cdb0001ea10b6468073aa446ca:crates/formualizer-eval/src/engine/tests/perf_tranche.rs \
+  > "$out/assets/perf_tranche.rs"
+git worktree add --detach "$fixed_source" 8a912b50a086a8cdb0001ea10b6468073aa446ca
+git worktree add --detach "$baseline_source" 2a8303d95acf2881c539e3700f7b8effc2e7bd35
+git -C "$baseline_source" apply "$out/assets/perf-tranche-419-421-baseline.patch"
+sed '/^\/\/ Regression tests/,$d' "$out/assets/perf_tranche.rs" \
+  > "$baseline_source/crates/formualizer-eval/src/engine/tests/perf_tranche.rs"
+(cd "$fixed_source" && RUSTC_WRAPPER= CARGO_TARGET_DIR="$out/target-fixed" \
+  cargo +1.93.0 test -p formualizer-eval --lib --release --no-run -j4)
 # Copy the executable path printed by Cargo to "$out/fixed-probe".
-git worktree add --detach "$out/baseline-source" 2a8303d95acf2881c539e3700f7b8effc2e7bd35
-git -C "$out/baseline-source" apply "$fix/benchmarks/perf-tranche-419-421-baseline.patch"
-sed '/^\/\/ Regression tests/,$d' "$fix/crates/formualizer-eval/src/engine/tests/perf_tranche.rs" \
-  > "$out/baseline-source/crates/formualizer-eval/src/engine/tests/perf_tranche.rs"
-(cd "$out/baseline-source" && cargo +1.93.0 test -p formualizer-eval --lib --release --no-run -j 4)
+(cd "$baseline_source" && RUSTC_WRAPPER= CARGO_TARGET_DIR="$out/target-baseline" \
+  cargo +1.93.0 test -p formualizer-eval --lib --release --no-run -j4)
 # Copy the newly emitted executable to "$out/baseline-probe".
 for run in baseline:1 fixed:1 fixed:2 baseline:2; do
   variant=${run%:*}; repeat=${run#*:}

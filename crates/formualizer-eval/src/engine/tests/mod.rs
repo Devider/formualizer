@@ -28,6 +28,7 @@ mod issue_432_logged_invalidation;
 mod issue_434_private_mutation_capture;
 mod layer_evaluation;
 mod load_fast_mappings;
+mod perf_ranges;
 mod perf_tranche;
 //mod mark_dirty_benchmarks;
 mod mark_dirty_multi_source;
