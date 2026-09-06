@@ -4,6 +4,7 @@ use crate::engine::arena::AstNodeId;
 use crate::engine::eval_delta::{
     DeltaCollector, DeltaMode, EvalDelta, EvalDeltaCompatibilityPolicy,
 };
+use crate::engine::graph::editor::change_log::MutationCapture;
 use crate::engine::graph::prepared_legacy_graph::{
     PreparedLegacyGraphError, PreparedLegacyGraphPlan,
 };
@@ -27,7 +28,7 @@ use crate::engine::used_extent::{
 };
 use crate::engine::virtual_deps::{DynamicRefVirtualDepProvider, VirtualDepBuilder};
 use crate::engine::{
-    CycleDetection, CyclePolicy, DependencyGraph, EvalConfig, EvaluationRequestKind,
+    ChangeLogger, CycleDetection, CyclePolicy, DependencyGraph, EvalConfig, EvaluationRequestKind,
     EvaluationRequestOutcome, EvaluationResourceBaselineStats, EvaluationResourceReason,
     EvaluationResourceRequestStats, FormulaDirtyLeaseOutcome, FormulaIngestBatch,
     FormulaIngestRecord, FormulaIngestReport, FormulaParseDiagnostic, FormulaParsePolicy,
@@ -1027,6 +1028,8 @@ pub struct Engine<R> {
     /// must not use relocated span read summaries to prove disconnection.
     legacy_island_structural_summaries_trusted: bool,
     cached_static_schedule: Option<CachedScheduleEntry>,
+    #[cfg(any(test, feature = "benchmark_internal"))]
+    recalc_reuse_probe: std::sync::Mutex<RecalcReuseProbe>,
     cached_mixed_topology: Option<CachedMixedTopology>,
     mixed_topology_cache_builds: u64,
     mixed_topology_cache_hits: u64,
@@ -1338,9 +1341,9 @@ where
 {
     engine: &'a mut Engine<R>,
     name: String,
-    // Optional external ChangeLog pointer used by `Engine::action_with_logger`.
+    // Complete private mutation capture used by atomic actions.
     // Stored as a raw pointer to avoid creating aliasing `&mut` borrows alongside `&mut Engine`.
-    log: Option<*mut crate::engine::ChangeLog>,
+    capture: Option<*mut MutationCapture>,
     // Optional Arrow undo journal used by `Engine::action_atomic`.
     // Stored as a raw pointer to avoid aliasing issues with `&mut Engine`.
     arrow_undo: Option<*mut crate::engine::ArrowUndoBatch>,
@@ -1372,13 +1375,13 @@ where
         col: u32,
         value: LiteralValue,
     ) -> Result<(), crate::engine::EditorError> {
-        if self.log.is_some() {
+        if self.capture.is_some() {
             let old_value = self.engine.read_cell_value(sheet, row, col);
             let mut old_formula = self.engine.read_cell_formula_ast(sheet, row, col);
             let addr = self.addr_for(sheet, row, col);
-            let Some(log_ptr) = self.log else {
+            let Some(capture_ptr) = self.capture else {
                 return Err(crate::engine::EditorError::TransactionFailed {
-                    reason: "action_with_logger: missing ChangeLog".to_string(),
+                    reason: "action_with_logger: missing mutation capture".to_string(),
                 });
             };
 
@@ -1412,11 +1415,11 @@ where
                 Some(old_value.clone().unwrap_or(LiteralValue::Empty))
             };
 
-            let start_len = unsafe { (&*log_ptr).len() };
+            let start_len = unsafe { (&*capture_ptr).len() };
 
-            // Safety: `log_ptr` comes from a unique `&mut ChangeLog` in `Engine::action_with_logger`.
-            let log = unsafe { &mut *log_ptr };
-            self.engine.edit_with_logger(log, |editor| {
+            // Safety: `capture_ptr` comes from a unique operation-local `&mut MutationCapture`.
+            let capture = unsafe { &mut *capture_ptr };
+            self.engine.edit_with_capture(capture, |editor| {
                 editor.set_cell_value_with_old_state(
                     addr,
                     value.clone(),
@@ -1433,7 +1436,7 @@ where
 
             if let Some(undo_ptr) = self.arrow_undo {
                 // 1) Spill snapshot operations (computed overlay rect restore).
-                let new_events = &unsafe { (&*log_ptr).events() }[start_len..];
+                let new_events = &unsafe { (&*capture_ptr).events() }[start_len..];
                 let undo = unsafe { &mut *undo_ptr };
                 self.engine
                     .record_spill_ops_into_arrow_undo(undo, new_events);
@@ -1463,13 +1466,13 @@ where
         col: u32,
         ast: ASTNode,
     ) -> Result<(), crate::engine::EditorError> {
-        if self.log.is_some() {
+        if self.capture.is_some() {
             let old_value = self.engine.read_cell_value(sheet, row, col);
             let mut old_formula = self.engine.read_cell_formula_ast(sheet, row, col);
             let addr = self.addr_for(sheet, row, col);
-            let Some(log_ptr) = self.log else {
+            let Some(capture_ptr) = self.capture else {
                 return Err(crate::engine::EditorError::TransactionFailed {
-                    reason: "action_with_logger: missing ChangeLog".to_string(),
+                    reason: "action_with_logger: missing mutation capture".to_string(),
                 });
             };
 
@@ -1509,11 +1512,11 @@ where
             } else {
                 None
             };
-            let start_len = unsafe { (&*log_ptr).len() };
+            let start_len = unsafe { (&*capture_ptr).len() };
 
-            // Safety: `log_ptr` comes from a unique `&mut ChangeLog` in `Engine::action_with_logger`.
-            let log = unsafe { &mut *log_ptr };
-            self.engine.edit_with_logger(log, |editor| {
+            // Safety: `capture_ptr` comes from a unique operation-local `&mut MutationCapture`.
+            let capture = unsafe { &mut *capture_ptr };
+            self.engine.edit_with_capture(capture, |editor| {
                 if let Some((ast_id, plan)) = admitted_formula {
                     editor.set_cell_formula_with_prepared_plan(
                         addr,
@@ -1540,7 +1543,7 @@ where
                 });
 
             if let Some(undo_ptr) = self.arrow_undo {
-                let new_events = &unsafe { (&*log_ptr).events() }[start_len..];
+                let new_events = &unsafe { (&*capture_ptr).events() }[start_len..];
                 let undo = unsafe { &mut *undo_ptr };
                 self.engine
                     .record_spill_ops_into_arrow_undo(undo, new_events);
@@ -1566,7 +1569,7 @@ where
         hidden: bool,
         source: RowVisibilitySource,
     ) -> Result<(), crate::engine::EditorError> {
-        if self.log.is_some() {
+        if self.capture.is_some() {
             let sheet_id = self.engine.ensure_known_sheet_id(sheet)?;
             let row0 = Engine::<R>::normalize_row_1based(row_1based)?;
             let old_hidden = self
@@ -1583,12 +1586,12 @@ where
                 .engine
                 .set_row_hidden_by_sheet_id(sheet_id, row0, hidden, source);
 
-            let Some(log_ptr) = self.log else {
+            let Some(capture_ptr) = self.capture else {
                 return Err(crate::engine::EditorError::TransactionFailed {
-                    reason: "action_with_logger: missing ChangeLog".to_string(),
+                    reason: "action_with_logger: missing mutation capture".to_string(),
                 });
             };
-            unsafe { &mut *log_ptr }.record(crate::engine::ChangeEvent::SetRowVisibility {
+            unsafe { &mut *capture_ptr }.record(crate::engine::ChangeEvent::SetRowVisibility {
                 sheet_id,
                 row0,
                 source,
@@ -1612,17 +1615,17 @@ where
         hidden: bool,
         source: RowVisibilitySource,
     ) -> Result<(), crate::engine::EditorError> {
-        if self.log.is_some() {
+        if self.capture.is_some() {
             let sheet_id = self.engine.ensure_known_sheet_id(sheet)?;
             let (start_row0, end_row0) =
                 Engine::<R>::normalize_row_range_1based(start_row_1based, end_row_1based)?;
 
-            let Some(log_ptr) = self.log else {
+            let Some(capture_ptr) = self.capture else {
                 return Err(crate::engine::EditorError::TransactionFailed {
-                    reason: "action_with_logger: missing ChangeLog".to_string(),
+                    reason: "action_with_logger: missing mutation capture".to_string(),
                 });
             };
-            let log = unsafe { &mut *log_ptr };
+            let capture = unsafe { &mut *capture_ptr };
 
             for row0 in start_row0..=end_row0 {
                 let old_hidden = self
@@ -1639,7 +1642,7 @@ where
                     .engine
                     .set_row_hidden_by_sheet_id(sheet_id, row0, hidden, source);
 
-                log.record(crate::engine::ChangeEvent::SetRowVisibility {
+                capture.record(crate::engine::ChangeEvent::SetRowVisibility {
                     sheet_id,
                     row0,
                     source,
@@ -1665,10 +1668,10 @@ where
         if count == 0 {
             return Ok(crate::engine::ShiftSummary::default());
         }
-        if self.log.is_some() {
-            let Some(log_ptr) = self.log else {
+        if self.capture.is_some() {
+            let Some(capture_ptr) = self.capture else {
                 return Err(crate::engine::EditorError::TransactionFailed {
-                    reason: "action_atomic: missing ChangeLog".to_string(),
+                    reason: "action_atomic: missing mutation capture".to_string(),
                 });
             };
 
@@ -1684,10 +1687,10 @@ where
 
             // Graph structural insert (logged) - no snapshot bump.
             let summary = {
-                let log = unsafe { &mut *log_ptr };
+                let capture = unsafe { &mut *capture_ptr };
                 let mut out: Result<crate::engine::ShiftSummary, crate::engine::EditorError> =
                     Ok(crate::engine::ShiftSummary::default());
-                self.engine.edit_with_logger(log, |editor| {
+                self.engine.edit_with_capture(capture, |editor| {
                     editor.set_structural_occupancy(occupancy);
                     out = editor.insert_rows(sheet_id, before0, count);
                 })?;
@@ -1708,7 +1711,6 @@ where
                 .clear_computed_overlay_after_row(sheet, before0 as usize);
             self.engine
                 .record_formula_plane_structural_change(StructuralScope::Region(affected_region));
-            self.engine.mark_topology_edited();
             if let Some(undo_ptr) = self.arrow_undo {
                 unsafe { &mut *undo_ptr }.record_insert_rows(sheet_id, before0, count);
             }
@@ -1748,10 +1750,10 @@ where
         if count == 0 {
             return Ok(crate::engine::ShiftSummary::default());
         }
-        if self.log.is_some() {
-            let Some(log_ptr) = self.log else {
+        if self.capture.is_some() {
+            let Some(capture_ptr) = self.capture else {
                 return Err(crate::engine::EditorError::TransactionFailed {
-                    reason: "action_atomic: missing ChangeLog".to_string(),
+                    reason: "action_atomic: missing mutation capture".to_string(),
                 });
             };
 
@@ -1763,10 +1765,10 @@ where
                 .demote_spans_preserving_computed_overlays(sheet_id, affected_region)?;
 
             let summary = {
-                let log = unsafe { &mut *log_ptr };
+                let capture = unsafe { &mut *capture_ptr };
                 let mut out: Result<crate::engine::ShiftSummary, crate::engine::EditorError> =
                     Ok(crate::engine::ShiftSummary::default());
-                self.engine.edit_with_logger(log, |editor| {
+                self.engine.edit_with_capture(capture, |editor| {
                     editor.set_structural_occupancy(occupancy);
                     out = editor.insert_columns(sheet_id, before0, count);
                 })?;
@@ -1784,7 +1786,6 @@ where
                 .clear_computed_overlay_after_col(sheet, before0 as usize);
             self.engine
                 .record_formula_plane_structural_change(StructuralScope::Region(affected_region));
-            self.engine.mark_topology_edited();
             if let Some(undo_ptr) = self.arrow_undo {
                 unsafe { &mut *undo_ptr }.record_insert_cols(sheet_id, before0, count);
             }
@@ -1867,6 +1868,26 @@ enum StructuralScope {
     RemovedSheet(SheetId),
     OpaqueGlobal,
     AllSheets,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum LoggedEditImpact {
+    NoOp,
+    DataOnly,
+    Topology,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoggedEditDirection {
+    Original,
+    InverseReplay,
+    ForwardReplay,
+}
+
+#[derive(Clone, Copy)]
+struct InvalidationBaseline {
+    snapshot_id: u64,
+    topology_epoch: u64,
 }
 
 struct SourceCacheSession {
@@ -2025,11 +2046,70 @@ struct ScheduleBuildMeta {
     schedule_cache_eligible: bool,
 }
 
+#[cfg(any(test, feature = "benchmark_internal"))]
+#[doc(hidden)]
+#[derive(Debug, Clone, Default)]
+pub struct RecalcReuseProbe {
+    pub schedule_requests: usize,
+    pub schedule_cache_hits: usize,
+    pub schedule_cache_misses: usize,
+    pub schedule_cache_ineligible: usize,
+    pub schedule_builds: usize,
+    pub schedule_shared_handles: usize,
+    pub schedule_retained_bytes: usize,
+    pub legacy_target_requests: usize,
+    pub target_schedule_builds: usize,
+    pub demand_builds: usize,
+    pub demand_vertices: usize,
+    pub demand_clean_formulas: usize,
+    pub demand_explicit_edges: usize,
+    pub demand_virtual_builder_calls: usize,
+}
+
+#[cfg(any(test, feature = "benchmark_internal"))]
+fn schedule_probe_retained_bytes(schedule: &crate::engine::Schedule) -> usize {
+    fn vector_bytes<T>(values: &Vec<T>) -> usize {
+        values.capacity() * std::mem::size_of::<T>()
+    }
+
+    [
+        vector_bytes(&schedule.units),
+        vector_bytes(&schedule.layers),
+        vector_bytes(&schedule.cycles),
+    ]
+    .into_iter()
+    .chain(
+        schedule
+            .layers
+            .iter()
+            .map(|layer| vector_bytes(&layer.vertices)),
+    )
+    .chain(schedule.cycles.iter().map(vector_bytes))
+    .sum()
+}
+
 #[derive(Debug, Clone)]
 struct CachedScheduleEntry {
     topology_epoch: u64,
     candidate_vertices: Vec<VertexId>,
-    schedule: crate::engine::scheduler::Schedule,
+    schedule: Arc<crate::engine::scheduler::Schedule>,
+}
+
+/// Uncacheable requests keep their schedule inline without a shared allocation.
+enum EvaluationSchedule {
+    Owned(crate::engine::scheduler::Schedule),
+    Shared(Arc<crate::engine::scheduler::Schedule>),
+}
+
+impl std::ops::Deref for EvaluationSchedule {
+    type Target = crate::engine::scheduler::Schedule;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(schedule) => schedule,
+            Self::Shared(schedule) => schedule,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2315,6 +2395,12 @@ type ScheduleBuildOutput = (
     ScheduleBuildMeta,
 );
 
+type EvaluationScheduleBuildOutput = (
+    EvaluationSchedule,
+    FxHashMap<VertexId, Vec<VertexId>>,
+    ScheduleBuildMeta,
+);
+
 /// Opaque, revision-bound recalculation recipe.
 #[derive(Debug)]
 pub struct RecalcPlan {
@@ -2443,7 +2529,7 @@ impl RecalcPlan {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) mod criteria_mask_test_hooks {
     use std::cell::Cell;
 
@@ -2803,6 +2889,8 @@ where
             topology_epoch: 0,
             legacy_island_structural_summaries_trusted: true,
             cached_static_schedule: None,
+            #[cfg(any(test, feature = "benchmark_internal"))]
+            recalc_reuse_probe: std::sync::Mutex::new(RecalcReuseProbe::default()),
             cached_mixed_topology: None,
             mixed_topology_cache_builds: 0,
             mixed_topology_cache_hits: 0,
@@ -2966,6 +3054,8 @@ where
             topology_epoch: 0,
             legacy_island_structural_summaries_trusted: true,
             cached_static_schedule: None,
+            #[cfg(any(test, feature = "benchmark_internal"))]
+            recalc_reuse_probe: std::sync::Mutex::new(RecalcReuseProbe::default()),
             cached_mixed_topology: None,
             mixed_topology_cache_builds: 0,
             mixed_topology_cache_hits: 0,
@@ -4929,7 +5019,7 @@ where
         let mut tx = EngineAction {
             engine: self,
             name: name.as_ref().to_string(),
-            log: None,
+            capture: None,
             arrow_undo: None,
             atomic_policy: false,
         };
@@ -4969,26 +5059,27 @@ where
         };
 
         let name_str = name.into();
-        let mut log = crate::engine::ChangeLog::new();
-        let start_len = log.len();
-        self.action_atomic_impl(&mut log, start_len, name_str, f)
+        let mut capture = MutationCapture::new(Default::default());
+        let start_len = capture.len();
+        self.action_atomic_impl(&mut capture, start_len, name_str, f)
     }
 
     fn action_atomic_impl<T>(
         &mut self,
-        log: &mut crate::engine::ChangeLog,
+        capture: &mut MutationCapture,
         start_len: usize,
         name: String,
         f: impl FnOnce(&mut EngineAction<'_, R>) -> Result<T, crate::engine::EditorError>,
     ) -> Result<(T, crate::engine::ActionJournal), crate::engine::EditorError> {
+        let invalidation_baseline = self.invalidation_baseline();
         let mut arrow_undo = crate::engine::ArrowUndoBatch::default();
         let arrow_ptr: *mut crate::engine::ArrowUndoBatch = &mut arrow_undo;
 
-        let log_ptr: *mut crate::engine::ChangeLog = log;
+        let capture_ptr: *mut MutationCapture = capture;
         let mut tx = EngineAction {
             engine: self,
             name: name.clone(),
-            log: Some(log_ptr),
+            capture: Some(capture_ptr),
             arrow_undo: Some(arrow_ptr),
             atomic_policy: true,
         };
@@ -4997,7 +5088,7 @@ where
 
         // Capture graph structural delta for this action.
         let graph_events: Vec<crate::engine::ChangeEvent> =
-            unsafe { (&*log_ptr).events() }[start_len..].to_vec();
+            unsafe { (&*capture_ptr).events() }[start_len..].to_vec();
         let graph_batch = crate::engine::GraphUndoBatch {
             events: graph_events,
         };
@@ -5015,12 +5106,17 @@ where
                     for event in &journal.graph.events {
                         self.record_formula_plane_change_for_event(event);
                     }
-                    self.mark_data_edited();
+                    self.invalidate_for_action_journal(
+                        &journal,
+                        LoggedEditDirection::Original,
+                        invalidation_baseline,
+                    );
                 }
                 Ok((v, journal))
             }
             Err(e) => {
-                if let Err(rb) = self.rollback_from_action_journal(&journal) {
+                if let Err(rb) = self.rollback_from_action_journal(&journal, invalidation_baseline)
+                {
                     return Err(crate::engine::EditorError::TransactionFailed {
                         reason: format!(
                             "Engine::action_atomic rollback failed after error '{e}': {rb}"
@@ -5042,7 +5138,7 @@ where
     /// Ticket 615: this variant provides atomicity. If the action returns an error, it rolls back:
     /// - Dependency graph structural edits (via inverse ChangeEvents)
     /// - Arrow-truth overlay writes mirrored from ChangeEvents
-    /// - ChangeLog entries (truncated back to the pre-action length)
+    /// - ChangeLog entries (published only after a successful commit)
     pub fn action_with_logger<T>(
         &mut self,
         log: &mut crate::engine::ChangeLog,
@@ -5063,23 +5159,24 @@ where
             _marker: std::marker::PhantomData,
         };
 
-        let start_len = log.len();
         let name_str = name.as_ref().to_string();
-        log.begin_compound(name_str.clone());
+        let mut capture = MutationCapture::new(log.current_meta());
+        let start_len = capture.len();
+        capture.begin_compound(name_str.clone());
 
-        // Use the provided ChangeLog as an observability sink.
-        // Correctness is provided by the internal `ActionJournal` returned from the atomic impl.
-        let res = self.action_atomic_impl(log, start_len, name_str, f);
+        // Mutation correctness uses the complete private capture. The provided ChangeLog remains
+        // an observability sink and is not touched until the action outcome is known.
+        let res = self.action_atomic_impl(&mut capture, start_len, name_str, f);
+        capture.close_compounds();
 
         match res {
             Ok((v, _journal)) => {
-                log.end_compound();
+                log.publish_capture(capture);
                 Ok(v)
             }
             Err(e) => {
-                // Close compound and truncate log as cleanup only.
-                log.end_compound();
-                log.truncate(start_len);
+                // Preserve sequence/group gaps without retaining failed events or evicting history.
+                log.discard_capture(capture);
                 Err(e)
             }
         }
@@ -5088,7 +5185,15 @@ where
     fn rollback_from_action_journal(
         &mut self,
         journal: &crate::engine::ActionJournal,
+        invalidation_baseline: InvalidationBaseline,
     ) -> Result<(), crate::engine::EditorError> {
+        // Invalidate first so a partial inverse failure cannot leave a changed
+        // graph behind an apparently current schedule or lookup cache.
+        self.invalidate_for_action_journal(
+            journal,
+            LoggedEditDirection::InverseReplay,
+            invalidation_baseline,
+        );
         // 1) Roll back the dependency graph structure.
         journal.graph.undo(&mut self.graph)?;
         // 2) Roll back engine row-visibility sidecar events.
@@ -5101,8 +5206,17 @@ where
     fn rollback_from_change_events(
         &mut self,
         events: &[crate::engine::ChangeEvent],
+        invalidation_baseline: InvalidationBaseline,
     ) -> Result<(), crate::engine::EditorError> {
         use crate::engine::ChangeEvent;
+
+        // Fail closed before applying inverses because replay can return after
+        // only part of the batch has been restored.
+        self.invalidate_for_change_events(
+            events,
+            LoggedEditDirection::InverseReplay,
+            invalidation_baseline,
+        );
 
         // 1) Roll back the dependency graph.
         {
@@ -5230,8 +5344,28 @@ where
         log: &mut crate::engine::ChangeLog,
         f: impl FnOnce(&mut crate::engine::VertexEditor) -> T,
     ) -> Result<T, crate::engine::EditorError> {
-        // Record starting log length so we can mirror only newly-recorded events.
-        let start_len = log.len();
+        let mut capture = MutationCapture::new(log.current_meta());
+        let result = self.edit_with_capture(&mut capture, f);
+        capture.close_compounds();
+        match result {
+            Ok(value) => {
+                log.publish_capture(capture);
+                Ok(value)
+            }
+            Err(error) => {
+                log.discard_capture(capture);
+                Err(error)
+            }
+        }
+    }
+
+    fn edit_with_capture<T>(
+        &mut self,
+        capture: &mut MutationCapture,
+        f: impl FnOnce(&mut crate::engine::VertexEditor) -> T,
+    ) -> Result<T, crate::engine::EditorError> {
+        let invalidation_baseline = self.invalidation_baseline();
+        let start_len = capture.len();
 
         // Provide a spill snapshot reader so VertexEditor can snapshot Arrow-truth spill values
         // (graph value cache is intentionally empty in canonical mode).
@@ -5264,13 +5398,13 @@ where
             };
             let mut editor = crate::engine::VertexEditor::with_logger_and_spill_reader(
                 &mut self.graph,
-                log,
+                capture,
                 &spill_reader,
             );
             f(&mut editor)
         };
 
-        let new_events = log.events()[start_len..].to_vec();
+        let new_events = capture.events()[start_len..].to_vec();
         if new_events.iter().any(|event| {
             matches!(
                 event,
@@ -5279,8 +5413,7 @@ where
                     | ChangeEvent::DeleteName { .. }
             )
         }) {
-            self.rollback_from_change_events(&new_events)?;
-            log.truncate(start_len);
+            self.rollback_from_change_events(&new_events, invalidation_baseline)?;
             return Err(crate::engine::EditorError::TransactionUnsupported {
                 reason: "name mutations must use Engine's prepared logged-name APIs".to_string(),
             });
@@ -5294,6 +5427,16 @@ where
         }
         for ev in &new_events {
             self.record_formula_plane_change_for_event(ev);
+        }
+
+        // Atomic EngineAction calls publish one invalidation for their complete
+        // journal at commit/rollback. Direct logged edits publish here.
+        if self.action_depth == 0 {
+            self.invalidate_for_change_events(
+                &new_events,
+                LoggedEditDirection::Original,
+                invalidation_baseline,
+            );
         }
 
         Ok(ret)
@@ -5401,6 +5544,10 @@ where
         .map_err(crate::engine::EditorError::Excel)
     }
 
+    /// Undo the last group still retained by the provided audit log.
+    ///
+    /// Disabled, zero-cap, and evicted history is unavailable on this index-based path. Use an
+    /// explicit `ActionJournal` with `undo_action` when undo must be independent of audit retention.
     pub fn undo_logged(
         &mut self,
         undo: &mut crate::engine::graph::editor::undo_engine::UndoEngine,
@@ -5412,10 +5559,18 @@ where
             .map(|index| log.events()[index].clone())
             .collect::<Vec<_>>();
         self.preflight_replay_admission(&pending_events, false)?;
+        let invalidation_baseline = self.invalidation_baseline();
         let names = Self::name_event_names(&pending_events);
         let prepared =
             self.prepare_name_dependent_span_demotion(names.iter().map(String::as_str))?;
-        let demoted = self.commit_name_dependent_span_demotion(prepared)?;
+        self.commit_name_dependent_span_demotion(prepared)?;
+        // UndoEngine can fail after partially applying the batch, so publish
+        // invalidation before replay rather than only on the success path.
+        self.invalidate_for_change_events(
+            &pending_events,
+            LoggedEditDirection::InverseReplay,
+            invalidation_baseline,
+        );
         let batch = undo.undo(&mut self.graph, log)?;
         for item in batch.iter().rev() {
             self.apply_inverse_row_visibility_event(&item.event);
@@ -5433,9 +5588,6 @@ where
             for item in &batch {
                 self.record_formula_plane_change_for_event(&item.event);
             }
-            if !demoted && !names.is_empty() {
-                self.mark_topology_edited();
-            }
         }
         Ok(())
     }
@@ -5447,10 +5599,16 @@ where
     ) -> Result<(), crate::engine::EditorError> {
         let pending_events = undo.pending_redo_events();
         self.preflight_replay_admission(&pending_events, true)?;
+        let invalidation_baseline = self.invalidation_baseline();
         let names = Self::name_event_names(&pending_events);
         let prepared =
             self.prepare_name_dependent_span_demotion(names.iter().map(String::as_str))?;
-        let demoted = self.commit_name_dependent_span_demotion(prepared)?;
+        self.commit_name_dependent_span_demotion(prepared)?;
+        self.invalidate_for_change_events(
+            &pending_events,
+            LoggedEditDirection::ForwardReplay,
+            invalidation_baseline,
+        );
         let batch = undo.redo(&mut self.graph, log)?;
         for item in &batch {
             self.apply_forward_row_visibility_event(&item.event);
@@ -5467,9 +5625,6 @@ where
         if !batch.is_empty() {
             for item in &batch {
                 self.record_formula_plane_change_for_event(&item.event);
-            }
-            if !demoted && !names.is_empty() {
-                self.mark_topology_edited();
             }
         }
         Ok(())
@@ -5489,6 +5644,7 @@ where
             undo.push_done_action(journal);
             return Err(error);
         }
+        let invalidation_baseline = self.invalidation_baseline();
         let names = Self::name_event_names(&journal.graph.events);
         let prepared =
             match self.prepare_name_dependent_span_demotion(names.iter().map(String::as_str)) {
@@ -5498,25 +5654,22 @@ where
                     return Err(error);
                 }
             };
-        let demoted = match self.commit_name_dependent_span_demotion(prepared) {
-            Ok(demoted) => demoted,
-            Err(error) => {
-                undo.push_done_action(journal);
-                return Err(error);
-            }
-        };
+        if let Err(error) = self.commit_name_dependent_span_demotion(prepared) {
+            undo.push_done_action(journal);
+            return Err(error);
+        }
 
+        self.invalidate_for_action_journal(
+            &journal,
+            LoggedEditDirection::InverseReplay,
+            invalidation_baseline,
+        );
         journal.graph.undo(&mut self.graph)?;
         self.apply_inverse_row_visibility_events(&journal.graph.events);
         self.apply_arrow_undo_batch(&journal.arrow, /*undo=*/ true);
         if !journal.graph.is_empty() || !journal.arrow.is_empty() {
             for event in &journal.graph.events {
                 self.record_formula_plane_change_for_event(event);
-            }
-            if !demoted && !names.is_empty() {
-                self.mark_topology_edited();
-            } else {
-                self.mark_data_edited();
             }
         }
 
@@ -5538,6 +5691,7 @@ where
             undo.push_redo_action(journal);
             return Err(error);
         }
+        let invalidation_baseline = self.invalidation_baseline();
         let names = Self::name_event_names(&journal.graph.events);
         let prepared =
             match self.prepare_name_dependent_span_demotion(names.iter().map(String::as_str)) {
@@ -5547,25 +5701,22 @@ where
                     return Err(error);
                 }
             };
-        let demoted = match self.commit_name_dependent_span_demotion(prepared) {
-            Ok(demoted) => demoted,
-            Err(error) => {
-                undo.push_redo_action(journal);
-                return Err(error);
-            }
-        };
+        if let Err(error) = self.commit_name_dependent_span_demotion(prepared) {
+            undo.push_redo_action(journal);
+            return Err(error);
+        }
 
+        self.invalidate_for_action_journal(
+            &journal,
+            LoggedEditDirection::ForwardReplay,
+            invalidation_baseline,
+        );
         journal.graph.redo(&mut self.graph)?;
         self.apply_forward_row_visibility_events(&journal.graph.events);
         self.apply_arrow_undo_batch(&journal.arrow, /*undo=*/ false);
         if !journal.graph.is_empty() || !journal.arrow.is_empty() {
             for event in &journal.graph.events {
                 self.record_formula_plane_change_for_event(event);
-            }
-            if !demoted && !names.is_empty() {
-                self.mark_topology_edited();
-            } else {
-                self.mark_data_edited();
             }
         }
 
@@ -5726,8 +5877,171 @@ where
         self.graph.set_sheet_index_mode(mode);
     }
 
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn mark_all_formulas_dirty_for_test(&mut self) {
+        self.mark_all_formula_vertices_dirty();
+        self.graph
+            .mark_all_formula_spans_dirty(WholeSpanDirtyReason::GlobalInvalidation);
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn take_criteria_mask_work_for_test() -> (usize, usize) {
+        criteria_mask_test_hooks::take_mask_work()
+    }
+
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn lookup_index_cache_report_for_test(&self) -> LookupIndexCacheReport {
+        self.lookup_index_cache.report()
+    }
+
+    #[cfg(any(test, feature = "benchmark_internal"))]
+    #[doc(hidden)]
+    pub fn reset_recalc_reuse_probe(&mut self) {
+        *self.recalc_reuse_probe.get_mut().unwrap() = RecalcReuseProbe::default();
+    }
+
+    #[cfg(any(test, feature = "benchmark_internal"))]
+    #[doc(hidden)]
+    pub fn recalc_reuse_probe(&self) -> RecalcReuseProbe {
+        let mut probe = self.recalc_reuse_probe.lock().unwrap().clone();
+        if let Some(cached) = self.cached_static_schedule.as_ref() {
+            probe.schedule_retained_bytes = std::mem::size_of::<CachedScheduleEntry>()
+                + cached.candidate_vertices.capacity() * std::mem::size_of::<VertexId>()
+                + std::mem::size_of::<crate::engine::Schedule>()
+                + 2 * std::mem::size_of::<usize>()
+                + schedule_probe_retained_bytes(&cached.schedule);
+        }
+        probe
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cached_static_schedule_for_test(&self) -> Option<Arc<crate::engine::Schedule>> {
+        self.cached_static_schedule
+            .as_ref()
+            .map(|cached| Arc::clone(&cached.schedule))
+    }
+
     fn clear_cached_static_schedule(&mut self) {
         self.cached_static_schedule = None;
+    }
+
+    fn invalidation_baseline(&self) -> InvalidationBaseline {
+        InvalidationBaseline {
+            snapshot_id: self.snapshot_id.load(std::sync::atomic::Ordering::Relaxed),
+            topology_epoch: self.topology_epoch,
+        }
+    }
+
+    fn classify_change_events(
+        events: &[crate::engine::ChangeEvent],
+        direction: LoggedEditDirection,
+    ) -> LoggedEditImpact {
+        use crate::engine::ChangeEvent;
+
+        events
+            .iter()
+            .map(|event| match event {
+                ChangeEvent::CompoundStart { .. } | ChangeEvent::CompoundEnd { .. } => {
+                    LoggedEditImpact::NoOp
+                }
+                ChangeEvent::SetRowVisibility { .. }
+                | ChangeEvent::SetValue {
+                    old_formula: None,
+                    old_value: Some(_),
+                    ..
+                } => LoggedEditImpact::DataOnly,
+                // Original canonical writes can lack an Arrow old value while
+                // updating an existing placeholder. Inverse replay actually
+                // removes that vertex; a later redo recreates it.
+                ChangeEvent::SetValue {
+                    old_formula: None,
+                    old_value: None,
+                    ..
+                } if direction == LoggedEditDirection::Original => LoggedEditImpact::DataOnly,
+                ChangeEvent::SetValue { .. }
+                | ChangeEvent::SetFormula { .. }
+                | ChangeEvent::AddVertex { .. }
+                | ChangeEvent::RemoveVertex { .. }
+                | ChangeEvent::VertexMoved { .. }
+                | ChangeEvent::FormulaAdjusted { .. }
+                | ChangeEvent::NamedRangeAdjusted { .. }
+                | ChangeEvent::EdgeAdded { .. }
+                | ChangeEvent::EdgeRemoved { .. }
+                | ChangeEvent::DefineName { .. }
+                | ChangeEvent::UpdateName { .. }
+                | ChangeEvent::DeleteName { .. }
+                | ChangeEvent::SpillCommitted { .. }
+                | ChangeEvent::SpillCleared { .. }
+                | ChangeEvent::StagedFormulaCellChanged { .. } => LoggedEditImpact::Topology,
+            })
+            .max()
+            .unwrap_or(LoggedEditImpact::NoOp)
+    }
+
+    fn classify_arrow_undo(arrow: &crate::engine::ArrowUndoBatch) -> LoggedEditImpact {
+        use crate::engine::ArrowOp;
+
+        arrow
+            .ops
+            .iter()
+            .map(|op| match op {
+                ArrowOp::SetDeltaCell { .. } | ArrowOp::SetComputedCell { .. } => {
+                    LoggedEditImpact::DataOnly
+                }
+                ArrowOp::RestoreComputedRect { .. }
+                | ArrowOp::InsertRows { .. }
+                | ArrowOp::InsertCols { .. } => LoggedEditImpact::Topology,
+            })
+            .max()
+            .unwrap_or(LoggedEditImpact::NoOp)
+    }
+
+    fn apply_logged_edit_impact(
+        &mut self,
+        impact: LoggedEditImpact,
+        baseline: InvalidationBaseline,
+    ) {
+        match impact {
+            LoggedEditImpact::NoOp => {}
+            LoggedEditImpact::DataOnly => {
+                if self.topology_epoch == baseline.topology_epoch
+                    && self.snapshot_id.load(std::sync::atomic::Ordering::Relaxed)
+                        == baseline.snapshot_id
+                {
+                    self.mark_data_edited();
+                }
+            }
+            LoggedEditImpact::Topology => {
+                // FormulaPlane demotion and some structural entry points already
+                // publish topology invalidation. Do not bump the same batch twice.
+                if self.topology_epoch == baseline.topology_epoch {
+                    self.mark_topology_edited();
+                }
+            }
+        }
+    }
+
+    fn invalidate_for_change_events(
+        &mut self,
+        events: &[crate::engine::ChangeEvent],
+        direction: LoggedEditDirection,
+        baseline: InvalidationBaseline,
+    ) {
+        self.apply_logged_edit_impact(Self::classify_change_events(events, direction), baseline);
+    }
+
+    fn invalidate_for_action_journal(
+        &mut self,
+        journal: &crate::engine::ActionJournal,
+        direction: LoggedEditDirection,
+        baseline: InvalidationBaseline,
+    ) {
+        let impact = Self::classify_change_events(&journal.graph.events, direction)
+            .max(Self::classify_arrow_undo(&journal.arrow));
+        self.apply_logged_edit_impact(impact, baseline);
     }
 
     /// Mark data edited: bump snapshot and set edited flag.
@@ -19231,6 +19545,13 @@ where
         mut delta: Option<&mut DeltaCollector>,
     ) -> Result<EvalResult, ExcelError> {
         use crate::engine::target_preparation::TargetProducer;
+        #[cfg(any(test, feature = "benchmark_internal"))]
+        {
+            self.recalc_reuse_probe
+                .get_mut()
+                .unwrap()
+                .legacy_target_requests += 1;
+        }
         let start = crate::instant::FzInstant::now();
         let root_vertices = roots
             .iter()
@@ -19247,6 +19568,13 @@ where
             let (precedents_to_eval, old_vdeps) = self.build_demand_subgraph(&root_vertices);
             if precedents_to_eval.is_empty() {
                 break;
+            }
+            #[cfg(any(test, feature = "benchmark_internal"))]
+            {
+                self.recalc_reuse_probe
+                    .get_mut()
+                    .unwrap()
+                    .target_schedule_builds += 1;
             }
             let scheduler = Scheduler::new(&self.graph);
             let schedule =
@@ -23090,7 +23418,11 @@ where
     fn create_evaluation_schedule(
         &mut self,
         to_evaluate: &[VertexId],
-    ) -> Result<ScheduleBuildOutput, ExcelError> {
+    ) -> Result<EvaluationScheduleBuildOutput, ExcelError> {
+        #[cfg(any(test, feature = "benchmark_internal"))]
+        {
+            self.recalc_reuse_probe.get_mut().unwrap().schedule_requests += 1;
+        }
         // Fold pending edge deltas once per schedule build so traversal uses
         // the zero-allocation CSR slices (#125).
         self.graph.flush_pending_edge_deltas();
@@ -23108,33 +23440,84 @@ where
                     schedule_cache_hit: true,
                     schedule_cache_eligible: true,
                 };
-                return Ok((cached.schedule.clone(), FxHashMap::default(), meta));
+                #[cfg(any(test, feature = "benchmark_internal"))]
+                {
+                    let mut probe = self.recalc_reuse_probe.lock().unwrap();
+                    probe.schedule_cache_hits += 1;
+                    probe.schedule_shared_handles += 1;
+                }
+                return Ok((
+                    EvaluationSchedule::Shared(Arc::clone(&cached.schedule)),
+                    FxHashMap::default(),
+                    meta,
+                ));
             }
 
             let (schedule, vdeps, mut meta) =
                 self.create_evaluation_schedule_uncached(to_evaluate)?;
             meta.schedule_cache_hit = false;
             meta.schedule_cache_eligible = true;
-            if vdeps.is_empty() {
+            #[cfg(any(test, feature = "benchmark_internal"))]
+            {
+                self.recalc_reuse_probe
+                    .get_mut()
+                    .unwrap()
+                    .schedule_cache_misses += 1;
+            }
+            let schedule = if vdeps.is_empty() {
+                // Clone previously discarded builder spare capacity. Keep that compact
+                // retained payload while sharing it with the current request.
+                let mut schedule = schedule;
+                schedule.units.shrink_to_fit();
+                for layer in &mut schedule.layers {
+                    layer.vertices.shrink_to_fit();
+                }
+                schedule.layers.shrink_to_fit();
+                for cycle in &mut schedule.cycles {
+                    cycle.shrink_to_fit();
+                }
+                schedule.cycles.shrink_to_fit();
+                let schedule = Arc::new(schedule);
+                #[cfg(any(test, feature = "benchmark_internal"))]
+                {
+                    self.recalc_reuse_probe
+                        .get_mut()
+                        .unwrap()
+                        .schedule_shared_handles += 1;
+                }
                 self.cached_static_schedule = Some(CachedScheduleEntry {
                     topology_epoch: self.topology_epoch,
                     candidate_vertices: to_evaluate.to_vec(),
-                    schedule: schedule.clone(),
+                    schedule: Arc::clone(&schedule),
                 });
-            }
+                EvaluationSchedule::Shared(schedule)
+            } else {
+                EvaluationSchedule::Owned(schedule)
+            };
             return Ok((schedule, vdeps, meta));
         }
 
         let (schedule, vdeps, mut meta) = self.create_evaluation_schedule_uncached(to_evaluate)?;
         meta.schedule_cache_hit = false;
         meta.schedule_cache_eligible = false;
-        Ok((schedule, vdeps, meta))
+        #[cfg(any(test, feature = "benchmark_internal"))]
+        {
+            self.recalc_reuse_probe
+                .get_mut()
+                .unwrap()
+                .schedule_cache_ineligible += 1;
+        }
+        Ok((EvaluationSchedule::Owned(schedule), vdeps, meta))
     }
 
     fn create_evaluation_schedule_uncached(
         &self,
         to_evaluate: &[VertexId],
     ) -> Result<ScheduleBuildOutput, ExcelError> {
+        #[cfg(any(test, feature = "benchmark_internal"))]
+        {
+            self.recalc_reuse_probe.lock().unwrap().schedule_builds += 1;
+        }
         let builder = VirtualDepBuilder::new(self);
         let (vdeps, augmented, builder_elapsed_ms, vdeps_edges) =
             if self.config.enable_virtual_dep_telemetry {
@@ -23325,6 +23708,8 @@ where
         let mut visited: FxHashSet<VertexId> = FxHashSet::default();
         let mut stack: Vec<VertexId> = Vec::new();
         let mut vdeps: FxHashMap<VertexId, Vec<VertexId>> = FxHashMap::default(); // incoming deps per vertex
+        #[cfg(any(test, feature = "benchmark_internal"))]
+        let (mut probe_vertices, mut probe_clean_formulas, mut probe_edges) = (0, 0, 0);
 
         for &t in target_vertices {
             stack.push(t);
@@ -23336,6 +23721,18 @@ where
             }
             if !self.graph.vertex_exists(v) {
                 continue;
+            }
+            #[cfg(any(test, feature = "benchmark_internal"))]
+            {
+                probe_vertices += 1;
+                if matches!(
+                    self.graph.get_vertex_kind(v),
+                    VertexKind::FormulaScalar | VertexKind::FormulaArray
+                ) && !self.graph.is_dirty(v)
+                    && !self.graph.is_volatile(v)
+                {
+                    probe_clean_formulas += 1;
+                }
             }
             // Schedule dirty/volatile formulas. Also schedule pass-through
             // Named*/Range vertices so the scheduler honours the
@@ -23371,12 +23768,20 @@ where
             // ``to_evaluate``; only Formula vertices are scheduled.
             if let Some(dependencies) = self.graph.dependencies_slice(v) {
                 for &dep in dependencies {
+                    #[cfg(any(test, feature = "benchmark_internal"))]
+                    {
+                        probe_edges += 1;
+                    }
                     if self.graph.vertex_exists(dep) && !visited.contains(&dep) {
                         stack.push(dep);
                     }
                 }
             } else {
                 for dep in self.graph.get_dependencies(v) {
+                    #[cfg(any(test, feature = "benchmark_internal"))]
+                    {
+                        probe_edges += 1;
+                    }
                     if self.graph.vertex_exists(dep) && !visited.contains(&dep) {
                         stack.push(dep);
                     }
@@ -23400,6 +23805,15 @@ where
         for deps in vdeps.values_mut() {
             deps.sort_unstable();
             deps.dedup();
+        }
+        #[cfg(any(test, feature = "benchmark_internal"))]
+        {
+            let mut probe = self.recalc_reuse_probe.lock().unwrap();
+            probe.demand_builds += 1;
+            probe.demand_vertices += probe_vertices;
+            probe.demand_clean_formulas += probe_clean_formulas;
+            probe.demand_explicit_edges += probe_edges;
+            probe.demand_virtual_builder_calls += probe_vertices;
         }
         (result, vdeps)
     }
@@ -25843,7 +26257,7 @@ where
         col_in_view: usize,
         pred: &crate::args::CriteriaPredicate,
     ) -> Option<std::sync::Arc<arrow_array::BooleanArray>> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         criteria_mask_test_hooks::note_mask(view.dims().0);
         if view.dims().1 == 0 {
             return None;

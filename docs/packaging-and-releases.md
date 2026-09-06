@@ -26,8 +26,9 @@ This repo publishes multiple artifacts (crates.io, PyPI, npm) from one monorepo.
 ### Python (PyPI)
 
 - `formualizer` (maturin / pyo3 extension): the product surface for Python.
-  - Published wheels: manylinux (x86_64, aarch64), musllinux (x86_64, aarch64), macOS (x86_64, arm64), Windows (x64), and **Pyodide** (`pyodide_<abi>_wasm32`) — all under the same PyPI project and version.
-  - End users install identically on every target: `pip install formualizer` on native, `await micropip.install("formualizer")` in a Pyodide runtime.
+  - Published native wheels: manylinux (x86_64, aarch64), musllinux (x86_64, aarch64), macOS (x86_64, arm64), and Windows (x64) on PyPI.
+  - Pyodide wheels (`pyodide_<abi>_wasm32`) are built and smoke-tested in CI and release workflows, then uploaded only as the `wheels-pyodide` Actions artifact; they are not uploaded to PyPI or attached to GitHub Releases.
+  - Native users install with `pip install formualizer`; Pyodide users extract the artifact, host the compatible wheel and install from its downloadable URL.
 
 ### JS/WASM (npm)
 
@@ -107,6 +108,27 @@ Use only the track being released. `--allow-dirty` exists for development checks
 
 Every track first asserts the parser/SDK lockstep rule: `formualizer-common` and `formualizer-parse` must carry the same manifest version, and the product track additionally requires that version to already exist on crates.io. A product release that pins an unpublished parser-track version fails here rather than at `cargo publish`.
 
+A parser source change cannot reuse a published parser-track version. In particular, landing the parser hardening from #408 changes the payload already published as `formualizer-parse` 3.1.0. Before the next product release, bump both `formualizer-common` and `formualizer-parse` to 3.1.1, publish the paired `parse-v3.1.1` track, and only then run the final product preflight. The same-version source-drift and published-parser gates are intentional and must not be bypassed. Publication remains a separate, explicitly authorized operation.
+
+Product preflight also checks binding feature semantics before any registry query, tool installation, or package build. `crates/formualizer/Cargo.toml` declares value-affecting features in `[package.metadata.formualizer-release]`; adding a feature there immediately requires every shipped binding profile to activate it. Exceptions require an independently reviewed checker-policy update as well as a substantive manifest rationale; adding opt-out metadata cannot authorize a new exception by itself.
+
+The current policy has one value-affecting feature, `system-clock`, and four shipped profiles:
+
+| Profile | Dependency edge | Policy |
+| --- | --- | --- |
+| `cffi-native` | `formualizer-workbook`, workspace-inherited defaults | Required through the workbook `default` feature set. |
+| `python-native` | `formualizer`, `cfg(not(target_os = "emscripten"))` | Required explicitly. |
+| `python-pyodide` | `formualizer`, `cfg(target_os = "emscripten")` | Reviewed opt-out: the portable profile uses a fixed or caller-injected clock. |
+| `wasm-browser` | `formualizer`, ordinary dependency | Required transitively through `wasm-js`. |
+
+The four profile names, manifests, dependencies, and exact target keys are fixed independently in the checker; binding metadata cannot redefine or remove that inventory. Only the approved Pyodide `system-clock` exception is represented in binding metadata.
+
+This is deliberately not a Cargo resolver. It supports the current non-overlapping edges, dependency defaults, additive explicit features on the CFFI workspace-inherited edge, and small same-package alias closure. Binding forwarding remains supported for existing non-value features, but weak forwarding and any forwarded source alias that reaches a value-affecting feature are rejected. Generic-plus-target overlap, unknown target layouts, optional policy dependencies, member `default-features` overrides, unsupported workspace inheritance, and stale opt-outs also fail.
+
+The topology boundary is the dependency tables declared by the three binding crates plus their declared workspace inheritance. A binding may directly depend on the roll-up, eval, workbook, or sheetport semantic crates only at the fixed profile edges; alternate normal or target-qualified edges and direct or workspace-renamed aliases are rejected. This is a precise check of the current declared topology, not a universal claim about every future transitive Cargo graph. A richer topology must escalate to Cargo's actual resolved graph for concrete release targets rather than extending this checker into another resolver.
+
+Policy dependency paths and their `Cargo.toml` files must remain non-symlinked inside the checkout and resolve to the expected package.
+
 For multi-crate tracks, the script packages crates in dependency order, adds each prospective archive to a temporary local Cargo registry, and verifies downstream archives against those exact bytes. Workspace path dependencies therefore cannot hide an unpublished or incompatible registry package. The staging registry and Cargo home are temporary; inherited Cargo/GitHub token variables are removed and Git prompting is disabled. The exact `cargo-local-registry` helper and its isolated download cache live under `target/release-preflight-*` without replacing a global tool.
 
 For every package, the preflight queries crates.io. A version that does not yet exist is accepted. If the version exists, the shipped source/data/doc payload must match exactly; generated `Cargo.toml`, `Cargo.lock`, and `.cargo_vcs_info.json` are excluded because they vary with Cargo or the source commit, while `Cargo.toml.orig` remains compared so dependency requirements are covered. Any other difference means the source must be restored or the package version bumped.
@@ -149,15 +171,15 @@ For npm builds, ensure the wasm-pack target matches what we publish (bundler vs 
 
 ## Pyodide wheel pipeline
 
-The Pyodide wheel is built by `bindings/python/scripts/build-pyodide-wheel.sh` on every PR (`ci.yml :: build-pyodide-wheel`) and on every product release tag (`release.yml :: build-wheels-pyodide`), then uploaded to PyPI by `publish-pypi` alongside the platform wheels.
+The Pyodide wheel is built by `bindings/python/scripts/build-pyodide-wheel.sh` and tested by `smoke-pyodide-wheel.sh` on every PR (`ci.yml :: build-pyodide-wheel`) and on every product release tag (`release.yml :: build-wheels-pyodide`), then uploaded only as the `wheels-pyodide` Actions artifact. The release workflow excludes it from PyPI and does not attach it to GitHub Releases.
 
 Key pipeline specifics worth knowing before touching this path:
 
-- **Pyodide version target is derived, not hardcoded.** The build script reads `pyodide xbuildenv version`, `python_version`, `emscripten_version`, `rust_toolchain`, `rustflags`, `cflags`, `cxxflags`, `ldflags`, and `rust_emscripten_target_url` from `pyodide config`. Bumping `pyodide-build` changes the target; everything else follows.
+- **Pyodide target has an explicit default.** The build script defaults to xbuildenv Pyodide 0.29.3, then reads `python_version`, `pyodide_abi_version`, `emscripten_version`, `rust_toolchain`, `rustflags`, `cflags`, `cxxflags`, `ldflags`, and `rust_emscripten_target_url` from `pyodide config`; the ABI and toolchain therefore derive from that xbuildenv. `pyodide-cli` and `pyodide-build` are resolved through `uvx` and are not pinned by the script.
 - **Custom Rust sysroot is mandatory.** Stock `rustup target add wasm32-unknown-emscripten` ships a `std` built with JS-trampoline exceptions (`invoke_*`), which Pyodide 0.29+ rejects with a dynamic-linking error at import time. The build script downloads Pyodide's prebuilt wasm-EH sysroot (`rust-emscripten-wasm-eh-sysroot` on GitHub) and extracts it over rustup's stock target. A sentinel file in the target dir makes this idempotent across runs.
-- **Wheel is retagged after build.** `pyodide-build 0.34` repacks wheels with `pyemscripten_2025_0_wasm32`, which the `micropip` shipped in Pyodide 0.29.x misparses as an Emscripten version string and rejects. The build script retags to `pyodide_2025_0_wasm32` (the tag Pyodide's own package lockfile uses), so `micropip.install` accepts the wheel without falling back to zip extraction.
-- **Smoke gate is mandatory.** Both CI and release jobs run `smoke-pyodide-wheel.sh`, which loads the wheel into a real Pyodide runtime and exercises parse, evaluate, byte I/O, and Python UDF paths. A broken wheel never reaches PyPI.
-- **Supported-Pyodide range is implicit in `pyodide-build` pin.** `pyodide-build 0.34.x` targets Pyodide 0.29.x (ABI `pyodide_2025_0`). When Pyodide cuts a new ABI, bump `pyodide-build` (and re-verify the sysroot URL in `pyodide config get rust_emscripten_target_url` still resolves), then cut a formualizer release. Document the supported Pyodide range in `bindings/python/README.md`.
+- **Wheel is retagged after build.** The resolved `pyodide-build` may emit `pyemscripten_2025_0_wasm32`, which the `micropip` shipped in Pyodide 0.29.x misparses as an Emscripten version string and rejects. The build script retags to the derived `pyodide_2025_0_wasm32` tag (the tag Pyodide 0.29.x expects), so `micropip.install` accepts the wheel without falling back to zip extraction.
+- **Smoke gate is mandatory.** Both CI and release jobs run `smoke-pyodide-wheel.sh`, which loads the wheel into a real Pyodide runtime and exercises parse, evaluate, byte I/O, and Python UDF paths. A broken wheel fails before the Actions artifact is uploaded.
+- **Tested runtime is explicit.** The build and smoke scripts default to Pyodide 0.29.3; the current derived wheel ABI is `pyodide_2025_0`. Select the build target with `PYODIDE_XBUILDENV_VERSION` and the smoke-test runtime with `PYODIDE_NPM_VERSION`; choose compatible values and smoke-test the rebuilt wheel against the selected runtime before distribution.
 
 ## Version Bump Script
 
