@@ -4,6 +4,21 @@ All notable changes to Formualizer will be documented in this file.
 
 ## Unreleased
 
+## [0.9.0] - 2026-09-06
+
+### Highlights
+
+- Improved lookup, reference-returning conditional, LET/LAMBDA, and temporal-value compatibility.
+- Fixed stale results after structural, named-symbol, logged, and atomic edits, with broader FormulaPlane parity coverage.
+- Reduced repeated criteria work, registry locking, range traversal, and schedule copying; exactly converged nonvolatile cycles can remain clean between recalculations.
+- Added Python workbook clock control, hardened parser and binding error paths, and corrected release package contents.
+
+### Compatibility notes
+
+- Rust callers constructing or matching `RangeKey::OpenRect` must use its four independent optional axis bounds instead of the former two optional coordinates. (#371)
+- Review temporal egress and runtime XLSX source selection below when upgrading. The `mmap` feature is now a compatibility no-op; mapping is an explicit runtime choice.
+- Product crates and Python/npm bindings move to **0.9.0**; common/parse move together to **3.1.1**. `sheetport-spec` remains **0.3.1** and the internal C ABI crate remains **0.1.0**.
+
 ### Changed
 
 - **Exactly converged circular cells are no longer re-run on every recalc.** Under `CyclePolicy::Iterate` the engine redirtied every iterating SCC at the end of each recalc, so every circular cell in a workbook was re-evaluated on every recalculation, like Excel. An SCC is now retained clean across recalcs when the recalc that iterated it stopped because every member reproduced its previous value exactly — `|Δ| == 0` for numbers, identity for text, booleans and errors, and never a NaN identity — before the `max_iterations` cap, with no volatile and no dynamic-reference (`INDIRECT`/`OFFSET`) member. Such an SCC is a fixed point of its own inputs, so re-running it with the same inputs cannot change a value: it runs again only when the dirty graph reaches a member (a precedent edit, a formula change, a structural edit, a name rebinding) or when a config knob that can change its result changes between recalcs (cycle policy or tolerance, date system, workbook seed, volatile level, deterministic mode, range-expansion limits) or when a function that a member calls is registered or replaced in the function registry. Tolerance-only convergence (`|Δ| < max_change` but non-zero), capped SCCs (including the `max_iterations: 1` accumulator contract) and volatile cycles keep re-running every recalc, exactly as before. Retention is unconditional (there is no knob): it changes only the work done, never a value, and retained SCCs are invalidated by the same machinery that invalidates every other formula. `CycleTelemetry::reused_sccs` and `CycleTelemetry::reused_scc_members` count the retained SCCs served without a re-run in a request, and `EngineBaselineStats::retained_scc_members` reports the retained population. Measured in release on 78 ring SCCs of 120 members each (9,360 circular cells) plus three downstream column families: a no-change recalc goes 70 ms -> 0.3 ms, an unrelated-cell edit 84 ms -> 0.9 ms, and an edit feeding one SCC goes 72 ms -> 2.6 ms with exactly one SCC re-run (two passes), on identical checksums. (#368)
@@ -23,14 +38,24 @@ All notable changes to Formualizer will be documented in this file.
 - Computed temporals are numeric during evaluation (`ISNUMBER`/`TYPE` now match Excel). Native scalar, range, table, Python, and SheetPort egress materializes date/time values from the cell's effective format; callers can opt into uniform raw serials. A known datetime class preserves midnight datetimes, while calamine's code-lossy date-ish signal can only classify pure fractions as time, day-plus-fraction serials as datetime, and integers as date.
 - Arrow dependencies upgraded 58.2 → 59.2 across `formualizer-eval` (`arrow`, `arrow-array`, `arrow-buffer`, `arrow-schema`, `arrow-select`, `arrow-cast`). No API or behaviour change; full suite green on the pinned surface, native and wasm32.
 
-- **Parser/SDK track `parse-v3.1.0`.** `formualizer-common` gains the number-format carrier introduced by the format channel work (`NumberFormat`, `FormatClass`, `numfmt::builtin_code`) and is published as 3.1.0; `formualizer-parse` moves to 3.1.0 with no source change so the two crates keep their documented shared version. Product crates now pin `formualizer-parse = "3.1.0"`. `scripts/release-preflight.py` asserts that the two parser-track manifests agree, and that a product-track preflight only passes once the pinned parser-track version is already on crates.io; previously the product preflight staged the workspace archives locally, passed, and left `cargo publish` to fail against the real registry.
+- **Parser/SDK track `parse-v3.1.1`.** The previously published 3.1.0 track introduced `NumberFormat`, `FormatClass`, and `numfmt::builtin_code`. This release advances both parser-track crates to 3.1.1 for parser hardening and package-content corrections; product crates now pin `formualizer-parse = "3.1.1"`. Release preflight requires matching common/parse versions and actual registry availability before the product track can publish. (#439, #444)
 - Pyodide wheel documentation now reflects distribution reality: native wheels are on PyPI, while Pyodide wheels are built and smoke-tested and retained as the `wheels-pyodide` Actions artifact for download or self-hosting from a compatible wheel URL.
 
 ### Performance
 
+- Bounded range traversal to relevant row segments and projected numeric/error lanes without repeatedly materializing unrelated values. Preserved order, overlays, ownership and cancellation behavior. Synthetic results and the small generic-head regression are documented in the benchmark report; these are not universal workbook speedup claims. (#436)
+- Shared immutable cached legacy schedules instead of deep-copying nested vectors on eligible requests. Cache eligibility and target routing are unchanged. Synthetic same-chain edit/recalculation medians improved, with shared-host attribution limits and a small alternating-case regression retained in the report. (#441)
+
 - **Reduced criteria, registry, and exact-lookup overhead.** Criteria masks are memoized per invocation, predicate, and column with a conservative 1 MiB admission charge; ordinary registry hits take a read lock and clone only the current function handle; exact indexes are reclaimed at exclusive Engine snapshot-mutation boundaries with retained-payload admission accounting. Matching rules are unchanged; tranche probes show less repeated mask work and fewer direct-registry allocations, while no-edit lookup recalculation reuses the index. (#431)
 
 ### Fixed
+
+- Resolved LET/LAMBDA locals before workbook named-range lookup in range-consuming arguments, so expressions such as `LET(r,A1:A3,SUM(r))` work and local names consistently shadow workbook names. (#339)
+- Preserved selected references through `IF`, `IFS`, and `CHOOSE`, allowing compositions such as `OFFSET(IF(TRUE,A1,B1),2,0)`. `IFERROR` and `IFNA` remain value-returning. (#369)
+- Propagated `IF` condition errors unchanged without evaluating either arm. (#372)
+- Made bounded single-cell `INDEX` selection read only the selected cell, avoiding phantom cycles under runtime cycle detection with bulk ingest. Static-cycle behavior and other INDEX shapes remain unchanged. (#370)
+- Preserved independent row/column bounds in open ranges, fixed zero-column plan labels, and handled wholly unbounded range dependencies without dropping coverage. (#371, #377)
+- Treated an omitted `XLOOKUP` fallback as absent rather than numeric zero, and kept exact text needles from matching numeric cells. (#340)
 
 - Logged formula/topology edits, atomic commits, and undo/redo now invalidate cached schedules and retained plans according to the replayed operation. Partial replay failures invalidate before returning; existing-cell value-only edits preserve eligible schedule hits while clearing lookup snapshots. (#435)
 
@@ -58,9 +83,20 @@ All notable changes to Formualizer will be documented in this file.
 
   Symbol vertices now hold a `SymbolAddr` in an address space disjoint from the grid's, and the structures keyed by position — the cell index, the per-sheet range index, and the iteration that drives every structural edit — accept a `GridAddr`, which a symbol cannot produce. `NameScope` is now purely lookup metadata and no longer decides where a vertex lives. Evaluation results are unchanged; a name's scope, resolution and dirty propagation all behave exactly as before.
 
+### Python bindings
+
+- Added `Workbook.set_deterministic_clock` to pin time on an existing workbook for its next recalculation, including deterministic embedding and Pyodide use. (#341)
+- Accepted `NImpl` and `Error` in `LiteralValue.error`, allowing all canonical error kinds to round-trip. (#354)
+- Replaced panicking AST/Token conversions and a Sheet cache-lock unwrap with Python error propagation while preserving callback reentrancy guards. (#404)
+
+### Packaging
+
+- Included canonical project license texts in Rust, Python, and npm package payloads. Python's declared license remains MIT; shipping both repository texts does not change that declaration. The published `sheetport-spec` 0.3.1 payload is unchanged. (#444)
+- Pinned native Rust/package release builds to Rust 1.93.0; Pyodide retains its xbuildenv-derived toolchain. Made release-preflight fixtures independent of the product version. (#442, #444)
+
 ### Security and hardening
 
-- Bounded parser recursion so excessively nested formulas return a parser error instead of exhausting the stack, with accepted-boundary coverage for 64 nested calls and parentheses. The limit counts parser frames rather than Excel nesting levels; recursive destruction of very long flat ASTs remains a separate known limitation (#411). Original recursion guard contributed by @chiliec. (#408)
+- Bounded parser recursion to 72 parser frames so excessively nested formulas return a parser error instead of exhausting the stack, with accepted-boundary coverage for 64 nested calls and parentheses. The limit counts parser frames rather than Excel nesting levels; recursive destruction of very long flat ASTs remains a separate known limitation (#411). Original recursion guard contributed by @chiliec. (#408)
 - Release preflight now fails closed when declared binding feature profiles drift from the canonical value-feature policy; Pyodide's explicit `system-clock` opt-out remains the only approved exception. (#433)
 
 - Bumped the docs site to Next.js `16.2.11`, clearing nine npm advisories affecting `next` `16.2.6` (four high: GHSA-89xv-2m56-2m9x, GHSA-p9j2-gv94-2wf4, GHSA-6gpp-xcg3-4w24, GHSA-m99w-x7hq-7vfj). The docs site's `bun.lock` was removed; `pnpm-lock.yaml` is the only lockfile the site builds and deploys from.
@@ -68,6 +104,10 @@ All notable changes to Formualizer will be documented in this file.
 ### Known limitations
 
 - Workbook undo can drop a dependent formula edge after writing a referenced empty cell (#301), leave a retained formula AST and dependency edge referring to different rows after undoing a logged row insertion (#303), truncate the changelog and lose the undone operation's audit record (#367), or leave an evaluated formula written to a fresh cell in place (#412). Long flat, left-associative chains can overflow the stack during recursive AST drop even when parsing returns `Ok` (#411).
+
+### Contributors
+
+Thanks to @Ocean82, @chiliec, and @tommy230 for contributed fixes, parser hardening, and independently captured lookup compatibility cases and reruns. The integration preserves original authorship. (#438, #439)
 
 ## [0.8.4] - 2026-08-14
 
@@ -535,7 +575,8 @@ All notable changes to Formualizer will be documented in this file.
 
 - Incomplete product release due to partial publication during the release workflow. Superseded by `0.5.1`.
 
-[Unreleased]: https://github.com/PSU3D0/formualizer/compare/v0.8.4...HEAD
+[Unreleased]: https://github.com/PSU3D0/formualizer/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/PSU3D0/formualizer/compare/v0.8.4...v0.9.0
 [0.8.4]: https://github.com/PSU3D0/formualizer/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/PSU3D0/formualizer/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/PSU3D0/formualizer/compare/v0.8.1...v0.8.2
