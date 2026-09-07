@@ -4,6 +4,16 @@ All notable changes to Formualizer will be documented in this file.
 
 ## Unreleased
 
+### Changed
+
+- `WorkbookLoadLimits` is now `#[non_exhaustive]`. Downstream struct-literal construction is disallowed; build one from `WorkbookLoadLimits::default()` and mutate the fields, or use a future builder. This is a deliberate breaking change so limits such as `max_external_cached_cells` can be added later without breaking downstream struct-literals again.
+
+### Fixed
+
+- In-workbook external references (`=[1]Sheet1!A1`) now evaluate from the cached values Excel stores in `xl/externalLinks/externalLinkN.xml` parts (spec §10), instead of failing with `#NAME?: Undefined name`. Excel never recalculates external links, so the cached values are the correct semantics. Sources are keyed structurally (book token + case-folded sheet + 1-based coordinates) via the shared `formualizer_common::external_cell_source_name` builder, so `=[1]Sheet1!A1`, `=[1]Sheet1!$A$1`, and `=[1]sheet1!a1` resolve to the same key. The scan is bounded by `WorkbookLoadLimits::max_external_cached_cells` (default 1,000,000) with a per-part byte budget, scan failures and the seeded count are reported in `AdapterLoadStats` (`external_link_scan_failures` / `external_cached_source_cells`), and `WorkbookConfig::with_external_cached_sources(false)` restores the previous `#NAME?` behavior. Only single-cell references are seeded; range references still route to source tables (`Undefined table`), deferred. (#363)
+
+  This adds public API to `formualizer-common` (`external_cell_source_name`) and `formualizer-parse` (`ExternalReference::source_name`). `formualizer-common` and `formualizer-parse` were published as 3.1.x, so the parse-side addition requires a new parser-track release (3.2.0) before the product crates can depend on it; call that release out when bumping.
+
 ## [0.9.0] - 2026-09-06
 
 ### Highlights

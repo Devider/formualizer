@@ -277,14 +277,12 @@ fn run(cli: Cli) -> Result<ProbeReport> {
         });
     }
 
-    let limits = WorkbookLoadLimits {
-        max_sheet_rows: 1_048_576,
-        max_sheet_cols: 16_384,
-        max_sheet_logical_cells: cli.logical_cell_budget,
-        sparse_sheet_cell_threshold: cli.sparse_sheet_threshold,
-        max_sparse_cell_ratio: cli.max_sparse_ratio,
-        ..WorkbookLoadLimits::default()
-    };
+    let mut limits = WorkbookLoadLimits::default();
+    limits.max_sheet_rows = 1_048_576;
+    limits.max_sheet_cols = 16_384;
+    limits.max_sheet_logical_cells = cli.logical_cell_budget;
+    limits.sparse_sheet_cell_threshold = cli.sparse_sheet_threshold;
+    limits.max_sparse_cell_ratio = cli.max_sparse_ratio;
 
     let load_start = Instant::now();
     eprintln!("[probe] opening workbook backend={}", cli.backend.label());
